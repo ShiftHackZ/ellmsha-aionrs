@@ -84,7 +84,7 @@ struct BootstrapEnvironment {
 }
 
 #[derive(Default)]
-struct McpBootstrap {
+pub(crate) struct McpBootstrap {
     // Active manager used for MCP-backed skills.
     manager: Option<Arc<McpManager>>,
 
@@ -229,7 +229,9 @@ impl AgentBootstrap {
             .then(|| Arc::new(RwLock::new(FileStateCache::new(&self.config.file_cache))))
     }
 
-    async fn connect_mcp(&self, registry: &mut ToolRegistry, builtin_names: &[String]) -> McpBootstrap {
+    // Shared by the full engine bootstrap and child agents, so runtime env,
+    // deferred schemas, name collision rules and connection lifetimes agree.
+    pub(crate) async fn connect_mcp(&self, registry: &mut ToolRegistry, builtin_names: &[String]) -> McpBootstrap {
         let server_configs = self.mcp_servers_with_runtime_env();
         if server_configs.is_empty() {
             return McpBootstrap::default();

@@ -3,13 +3,18 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use aion_agent::spawner::{AgentSpawner, SubAgentConfig};
+use aion_agent::spawner::{ForkOverrides, Spawner};
 use aion_agent::tool_policy::ToolPolicy;
+use aion_config::config::{McpServerConfig, TransportType};
 use aion_providers::{LlmProvider, ProviderError};
 use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{StopReason, TokenUsage};
 use async_trait::async_trait;
 use common::{MockLlmProvider, test_config};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 struct ToolRecordingProvider {
     tool_names: Arc<Mutex<Vec<String>>>,
@@ -82,6 +87,92 @@ async fn restricted_parent_policy_limits_spawned_agent_tools() {
 
     assert!(!result.is_error, "expected restricted sub-agent to complete");
     assert_eq!(*tool_names.lock().unwrap(), vec!["Grep", "Read"]);
+}
+
+/// Both ordinary children and skill forks must actually execute inherited MCP
+/// calls, not merely inherit a config value that never becomes a tool registry.
+#[tokio::test]
+async fn spawned_and_forked_agents_can_call_parent_memory_mcp() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(|request: &Request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let result = match body["method"].as_str().unwrap_or_default() {
+            "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"memory-fixture","version":"1"}}),
+            "tools/list" => json!({"tools":[{"name":"tdai_memory_read","description":"Read project memory","inputSchema":{"type":"object","properties":{}}}]}),
+            "tools/call" => json!({"content":[{"type":"text","text":"Juniper-92"}],"isError":false}),
+            _ => json!({}),
+        };
+        ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+    }).mount(&server).await;
+    let mut config = test_config();
+    config.mcp.servers.insert(
+        "memory".into(),
+        McpServerConfig {
+            transport: TransportType::StreamableHttp,
+            command: None,
+            args: None,
+            env: None,
+            url: Some(server.uri()),
+            headers: None,
+            deferred: Some(true),
+            startup_timeout_ms: Some(1000),
+        },
+    );
+    let response = || {
+        vec![
+            LlmEvent::ToolUse {
+                id: "read-1".into(),
+                name: "tdai_memory_read".into(),
+                input: json!({}),
+                extra: None,
+            },
+            LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+        ]
+    };
+    let done = || {
+        vec![
+            LlmEvent::TextDelta("Memory read completed".into()),
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]
+    };
+    let provider = Arc::new(MockLlmProvider::with_turns(vec![
+        response(),
+        done(),
+        response(),
+        done(),
+    ]));
+    let spawner = AgentSpawner::new(provider, config.clone(), std::env::temp_dir(), ToolPolicy::Unrestricted);
+    assert!(!spawner.spawn_one(make_sub_config("normal")).await.is_error);
+    assert!(
+        !spawner
+            .spawn_fork(make_sub_config("fork"), ForkOverrides::default())
+            .await
+            .is_error
+    );
+    let requests = server.received_requests().await.unwrap();
+    let calls: Vec<Value> = requests
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .filter(|body: &Value| body["method"] == "tools/call")
+        .collect();
+    assert_eq!(calls.len(), 2, "both subagent paths must execute the configured MCP");
+    assert!(calls.iter().all(|call| call["params"]["name"] == "tdai_memory_read"));
+
+    // A restricted child must neither advertise the memory tool nor discover its
+    // deferred schema through ToolSearch. Ordinary tool access remains intact.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ToolRecordingProvider {
+        tool_names: Arc::clone(&seen),
+    });
+    let restricted = AgentSpawner::new(provider, config, std::env::temp_dir(), ToolPolicy::allow_only(["Read"]));
+    assert!(!restricted.spawn_one(make_sub_config("restricted")).await.is_error);
+    assert_eq!(*seen.lock().unwrap(), vec!["Read"]);
 }
 
 /// Parallel sub-agents all complete successfully and return distinct results.

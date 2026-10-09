@@ -11,9 +11,11 @@ use aion_tools::glob::GlobTool;
 use aion_tools::grep::GrepTool;
 use aion_tools::read::ReadTool;
 use aion_tools::registry::ToolRegistry;
+use aion_tools::tool_search::ToolSearchTool;
 use aion_tools::write::WriteTool;
 use aion_types::message::TokenUsage;
 
+use crate::bootstrap::{AgentBootstrap, McpBootstrap};
 use crate::engine::AgentEngine;
 use crate::output::OutputSink;
 use crate::output::null_sink::NullSink;
@@ -74,7 +76,7 @@ impl AgentSpawner {
         tracing::info!(target: "aion_agent", cwd = %self.cwd.display(), "sub-agent spawned with workspace cwd");
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &[]);
-        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env);
+        let (tools, _mcp) = self.build_child_tools(&config, &child_policy).await;
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -139,6 +141,21 @@ impl AgentSpawner {
             tool_policy: self.tool_policy.clone(),
         }
     }
+
+    async fn build_child_tools(&self, config: &Config, policy: &ToolPolicy) -> (ToolRegistry, McpBootstrap) {
+        let mut tools = build_tool_registry(policy, &self.cwd, &self.runtime_env);
+        let builtin_names = tools.tool_names();
+        let bootstrap = AgentBootstrap::new(config.clone(), self.cwd.to_string_lossy(), Arc::new(NullSink))
+            .runtime_env(self.runtime_env.clone());
+        let mcp = bootstrap.connect_mcp(&mut tools, &builtin_names).await;
+        if !config.mcp.servers.is_empty() {
+            // MCP schemas are deferred by default, just as in the parent engine.
+            // Respect the inherited tool policy in both discovery and execution.
+            let definitions = tools.to_tool_defs_filtered(|tool| policy.allows(tool.name()));
+            tools.register(Box::new(ToolSearchTool::new(definitions)));
+        }
+        (tools, mcp)
+    }
 }
 
 #[async_trait]
@@ -157,7 +174,7 @@ impl Spawner for AgentSpawner {
         }
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &overrides.allowed_tools);
-        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env);
+        let (tools, _mcp) = self.build_child_tools(&config, &child_policy).await;
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
