@@ -1,3 +1,45 @@
+<!-- ELLMSHA FORK INTRO -->
+# AionRS — eLLMsha integration fork
+
+**Native agent execution used by AionCore.**
+
+| Provenance | Value |
+| --- | --- |
+| Original project | [AionRS](https://github.com/iOfficeAI/aionrs) |
+| Upstream baseline | `v0.2.8` |
+| Baseline revision | `4bd4f3254f6d875f122b648dd55116516c380d31` |
+| Harness patch label | 1 |
+
+## Why this fork exists
+
+Maintains the native runtime integration used by the eLLMsha harness, including delegated tool access.
+
+```mermaid
+flowchart LR
+  Harness[eLLMsha harness] --> Component[AionRS]
+  Component --> Work[Project work]
+```
+
+## Build and integration
+
+Consumed through sibling Cargo path dependencies. The local baseline must be made reachable in the maintained fork before clean-clone distribution.
+
+The parent repository's installer and integration checks are authoritative for the bundled product. A passing upstream test suite alone does not prove eLLMsha integration acceptance. This local documentation update does not publish a release or make unpublished revisions available remotely.
+
+## Contributing
+
+Keep changes focused, preserve upstream licenses and notices, and separate an upstream version update from a harness patch. Record both in the parent application's About provenance. Do not commit credentials, user profiles or commercial project contents. Validate behavior on the platform being changed.
+
+## License and credits
+
+See [LICENSE](LICENSE). Original authors and their license terms remain unchanged. **Moroz Inc.** maintains the eLLMsha integration.
+
+---
+
+## Upstream documentation
+
+<!-- END ELLMSHA FORK INTRO -->
+
 # aionrs
 
 A Rust-based LLM tool-use agent for the command line. It connects to LLM APIs, autonomously invokes local tools (file I/O, shell, search, etc.), and completes tasks end-to-end.
