@@ -3,6 +3,39 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn malformed_arguments_reject_entire_tool_round_without_fabricating_empty_input() {
+        for invalid in ["", "{\"query\":", "[1]", "null"] {
+            let mut state = StreamState::new();
+            let chunk = json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "valid", "function": {"name": "search", "arguments": "{\"query\":\"ok\"}"}},
+                {"index": 1, "id": "invalid", "function": {"name": "search", "arguments": invalid}}
+            ]}, "finish_reason": "tool_calls"}]});
+            let events = parse_sse_chunk(&chunk.to_string(), &mut state, false);
+            assert!(matches!(events.as_slice(), [LlmEvent::Error(message)] if message.contains("entire tool round")));
+            assert!(state.tool_calls.is_empty());
+            assert!(state.flush_done().is_none());
+        }
+    }
+
+    #[test]
+    fn tool_arguments_preserve_empty_object_and_chunked_json() {
+        let mut state = StreamState::new();
+        let first = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "empty", "function": {"name": "list", "arguments": "{}"}},
+            {"index": 1, "id": "search", "function": {"name": "search", "arguments": "{\"query\":\"при"}}
+        ]}}]});
+        assert!(parse_sse_chunk(&first.to_string(), &mut state, false).is_empty());
+        let last = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 1, "function": {"arguments": "вет\",\"limit\":2}"}}
+        ]}, "finish_reason": "tool_calls"}]});
+        let events = parse_sse_chunk(&last.to_string(), &mut state, false);
+        assert!(matches!(&events[0], LlmEvent::ToolUse { input, .. } if input == &json!({})));
+        assert!(matches!(&events[1], LlmEvent::ToolUse { input, .. } if input == &json!({"query":"привет","limit":2})));
+        assert_eq!(events.len(), 2);
+    }
 
     // --- usage token parsing ---
 

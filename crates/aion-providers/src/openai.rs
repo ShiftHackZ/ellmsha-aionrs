@@ -10,6 +10,7 @@ use aion_types::message::{StopReason, TokenUsage};
 use crate::composed::ComposedProvider;
 use crate::openai_messages::generate_call_id;
 use crate::stream_diagnostics::{OpenAiStreamDiagnostics, StreamTermination};
+use crate::tool_call_sanitize::parse_tool_arguments;
 use crate::transport::{OpenAiTransport, ProviderTransport};
 use crate::{LlmProvider, ProviderError};
 use aion_config::compat::ProviderCompat;
@@ -181,16 +182,27 @@ pub(crate) fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id:
         match finish_reason {
             "tool_calls" | "stop" => {
                 if !state.tool_calls.is_empty() {
+                    let calls = std::mem::take(&mut state.tool_calls);
+                    let inputs = match calls
+                        .iter()
+                        .map(|call| parse_tool_arguments(&call.arguments))
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(inputs) => inputs,
+                        Err(error) => {
+                            state.pending_done = None;
+                            events.push(LlmEvent::Error(error.to_owned()));
+                            return events;
+                        }
+                    };
                     // Emit accumulated tool calls. Gemini uses "stop" instead of
                     // "tool_calls" as finish_reason, so we handle both here.
-                    for tc in state.tool_calls.drain(..) {
+                    for (tc, input) in calls.into_iter().zip(inputs) {
                         let id = if tc.id.is_empty() && auto_tool_id {
                             generate_call_id()
                         } else {
                             tc.id
                         };
-                        let input: Value =
-                            serde_json::from_str(&tc.arguments).unwrap_or(Value::Object(serde_json::Map::new()));
                         if tc.name.is_empty() {
                             tracing::warn!(
                                 target: "aion_providers",

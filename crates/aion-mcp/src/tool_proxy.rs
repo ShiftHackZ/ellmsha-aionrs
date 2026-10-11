@@ -74,10 +74,7 @@ impl Tool for McpToolProxy {
 
     async fn execute(&self, input: Value) -> ToolResult {
         match self.manager.call_tool(&self.server_name, &self.tool_name, input).await {
-            Ok(content) => ToolResult {
-                content,
-                is_error: false,
-            },
+            Ok(result) => result,
             Err(e) => ToolResult {
                 content: format!("MCP tool error: {}", e),
                 is_error: true,

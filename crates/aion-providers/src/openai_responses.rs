@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::tool_call_sanitize::parse_tool_arguments;
 use aion_types::llm::LlmEvent;
 use aion_types::message::{StopReason, TokenUsage};
 use serde_json::{Map, Value};
@@ -33,7 +34,7 @@ pub(crate) fn parse_sse_chunk(data: &str, state: &mut StreamState) -> Vec<LlmEve
     };
     let event_type = json.get("type").and_then(Value::as_str).unwrap_or_default();
 
-    match event_type {
+    let mut events = match event_type {
         "response.output_text.delta" | "response.refusal.delta" => json
             .get("delta")
             .and_then(Value::as_str)
@@ -55,7 +56,12 @@ pub(crate) fn parse_sse_chunk(data: &str, state: &mut StreamState) -> Vec<LlmEve
         "response.failed" => failed_response(&json, state),
         "error" => error_event(&json, state),
         _ => Vec::new(),
+    };
+    if events.iter().any(|event| matches!(event, LlmEvent::Error(_))) {
+        state.terminal = true;
+        events.retain(|event| !matches!(event, LlmEvent::ToolUse { .. } | LlmEvent::Done { .. }));
     }
+    events
 }
 
 fn complete_response(event: &Value, state: &mut StreamState) -> Vec<LlmEvent> {
@@ -150,8 +156,11 @@ fn events_for_output_item(item: &Value, state: &mut StreamState) -> Vec<LlmEvent
 fn function_call_event(item: &Value, state: &mut StreamState) -> Option<LlmEvent> {
     let call_id = item.get("call_id").and_then(Value::as_str)?.to_string();
     let name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-    let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("{}");
-    let input = serde_json::from_str(arguments).unwrap_or_else(|_| Value::Object(Map::new()));
+    let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+    let input = match parse_tool_arguments(arguments) {
+        Ok(input) => input,
+        Err(error) => return Some(LlmEvent::Error(error.to_owned())),
+    };
 
     let mut provider_metadata = Map::new();
     let mut function_call = Map::new();

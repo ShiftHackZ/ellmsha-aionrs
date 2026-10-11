@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use aion_types::tool::ToolResult;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
 
@@ -235,7 +236,7 @@ impl McpManager {
         server_name: &str,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<String, McpError> {
+    ) -> Result<ToolResult, McpError> {
         let server = self
             .servers
             .get(server_name)
@@ -273,7 +274,13 @@ impl McpManager {
             }
         }
 
-        Ok(text_parts.join("\n"))
+        if tool_result.is_error {
+            tracing::warn!(target: "aion_mcp", server = server_name, tool = tool_name, "mcp tool returned an error result");
+        }
+        Ok(ToolResult {
+            content: text_parts.join("\n"),
+            is_error: tool_result.is_error,
+        })
     }
 
     /// Get names of all connected servers.

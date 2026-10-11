@@ -9,7 +9,7 @@ use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use aion_types::tool::ToolDef;
 
 use crate::projector::{ResolvedToolWireShape, project_tools};
-use crate::tool_call_sanitize::{DroppedToolCallReason, format_dropped_tool_call};
+use crate::tool_call_sanitize::{DroppedToolCallReason, format_dropped_tool_call, parse_tool_arguments};
 use aion_config::compat::ProviderCompat;
 
 /// Convert internal Message format to Anthropic API message format.
@@ -259,6 +259,8 @@ pub struct StreamState {
     pub current_block_type: Option<String>,
     /// Accumulated tool input JSON fragments
     pub tool_input_json: String,
+    /// Initial block input covers zero-argument tools with no delta frames.
+    tool_initial_input: Option<Value>,
     /// Tool use ID for current block
     pub tool_id: String,
     /// Tool name for current block
@@ -284,6 +286,7 @@ impl StreamState {
         Self {
             current_block_type: None,
             tool_input_json: String::new(),
+            tool_initial_input: None,
             tool_id: String::new(),
             tool_name: String::new(),
             input_tokens: 0,
@@ -325,6 +328,7 @@ pub fn parse_sse_data(event_type: &str, data: &str, state: &mut StreamState) -> 
                 state.tool_id = block["id"].as_str().unwrap_or("").to_string();
                 state.tool_name = block["name"].as_str().unwrap_or("").to_string();
                 state.tool_input_json.clear();
+                state.tool_initial_input = block.get("input").cloned();
             }
         }
 
@@ -359,8 +363,24 @@ pub fn parse_sse_data(event_type: &str, data: &str, state: &mut StreamState) -> 
 
         "content_block_stop" => {
             if state.current_block_type.as_deref() == Some("tool_use") {
-                let input: Value =
-                    serde_json::from_str(&state.tool_input_json).unwrap_or(Value::Object(serde_json::Map::new()));
+                let arguments = if state.tool_input_json.is_empty() {
+                    state
+                        .tool_initial_input
+                        .take()
+                        .map(|value| value.to_string())
+                        .unwrap_or_default()
+                } else {
+                    std::mem::take(&mut state.tool_input_json)
+                };
+                let input = match parse_tool_arguments(&arguments) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        state.current_block_type = None;
+                        state.tool_initial_input = None;
+                        events.push(LlmEvent::Error(error.to_owned()));
+                        return events;
+                    }
+                };
                 if state.tool_name.is_empty() {
                     tracing::warn!(
                         target: "aion_providers",

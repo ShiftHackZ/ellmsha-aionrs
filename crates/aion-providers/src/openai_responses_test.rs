@@ -7,6 +7,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_function_arguments_fail_streamed_and_completed_responses() {
+        for arguments in [json!("{\"query\":"), json!(""), json!("null"), json!(null), json!({})] {
+            let item =
+                json!({"id":"bad", "type":"function_call", "call_id":"bad", "name":"search", "arguments":arguments});
+            let valid = json!({"id":"ok", "type":"function_call", "call_id":"ok", "name":"list", "arguments":"{}"});
+            for event in [
+                json!({"type":"response.output_item.done", "item":item}),
+                json!({"type":"response.completed", "response":{"output":[valid, item]}}),
+            ] {
+                let mut state = StreamState::new();
+                let events = parse_sse_chunk(&event.to_string(), &mut state);
+                assert!(
+                    matches!(events.as_slice(), [LlmEvent::Error(message)] if message.contains("entire tool round"))
+                );
+                assert!(state.is_terminal());
+            }
+        }
+    }
+
+    #[test]
+    fn function_arguments_preserve_valid_and_empty_objects() {
+        for input in [json!({}), json!({"query":"привет", "limit":2})] {
+            let mut state = StreamState::new();
+            let event = json!({"type":"response.output_item.done", "item":{
+                "id":"ok", "type":"function_call", "call_id":"ok", "name":"search", "arguments":input.to_string()
+            }});
+            let events = parse_sse_chunk(&event.to_string(), &mut state);
+            assert!(matches!(events.as_slice(), [LlmEvent::ToolUse {input: actual, ..}] if actual == &input));
+        }
+    }
+
+    #[test]
     fn parses_text_reasoning_and_refusal_deltas() {
         let mut state = StreamState::new();
 

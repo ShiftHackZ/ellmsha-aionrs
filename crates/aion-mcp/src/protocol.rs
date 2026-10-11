@@ -63,6 +63,8 @@ pub struct McpToolDef {
 #[derive(Debug, Deserialize)]
 pub struct McpToolResult {
     pub content: Vec<McpContent>,
+    #[serde(rename = "isError", default)]
+    pub is_error: bool,
 }
 
 /// Content types returned by MCP tool calls

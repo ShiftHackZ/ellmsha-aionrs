@@ -814,6 +814,48 @@ mod tests {
     // --- parse_sse_data tests ---
 
     #[test]
+    fn malformed_tool_arguments_surface_error_without_empty_tool_use() {
+        for arguments in ["{\"query\":", "null", "[]"] {
+            let mut state = StreamState::new();
+            parse_sse_data(
+                "content_block_start",
+                r#"{"content_block":{"type":"tool_use","id":"bad","name":"search","input":{}}}"#,
+                &mut state,
+            );
+            parse_sse_data(
+                "content_block_delta",
+                &json!({"delta":{"type":"input_json_delta","partial_json":arguments}}).to_string(),
+                &mut state,
+            );
+            let events = parse_sse_data("content_block_stop", "{}", &mut state);
+            assert!(matches!(events.as_slice(), [LlmEvent::Error(message)] if message.contains("entire tool round")));
+        }
+    }
+
+    #[test]
+    fn tool_arguments_preserve_explicit_initial_and_streamed_objects() {
+        for input in [json!({}), json!({"query":"привет", "limit":2})] {
+            for streamed in [false, true] {
+                let mut state = StreamState::new();
+                parse_sse_data(
+                    "content_block_start",
+                    &json!({"content_block":{"type":"tool_use","id":"ok","name":"search","input":if streamed { json!({}) } else { input.clone() }}}).to_string(),
+                    &mut state,
+                );
+                if streamed {
+                    parse_sse_data(
+                        "content_block_delta",
+                        &json!({"delta":{"type":"input_json_delta","partial_json":input.to_string()}}).to_string(),
+                        &mut state,
+                    );
+                }
+                let events = parse_sse_data("content_block_stop", "{}", &mut state);
+                assert!(matches!(events.as_slice(), [LlmEvent::ToolUse {input: actual, ..}] if actual == &input));
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_anthropic_event_text_delta() {
         // arrange
         let mut state = StreamState::new();
@@ -867,7 +909,7 @@ mod tests {
 
         let start_events = parse_sse_data(
             "content_block_start",
-            r#"{"content_block":{"type":"tool_use","id":"call_x","name":""}}"#,
+            r#"{"content_block":{"type":"tool_use","id":"call_x","name":"","input":{}}}"#,
             &mut state,
         );
         assert!(start_events.is_empty());

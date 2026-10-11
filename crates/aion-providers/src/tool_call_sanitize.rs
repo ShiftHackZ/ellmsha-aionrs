@@ -1,3 +1,17 @@
+/// Invalid tool arguments must fail the provider turn, never become an executable
+/// empty object. Keep diagnostics free of argument contents.
+pub(crate) fn parse_tool_arguments(arguments: &str) -> Result<serde_json::Value, &'static str> {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) if value.is_object() => Ok(value),
+        _ => {
+            tracing::warn!(target: "aion_providers", "provider returned malformed tool arguments; tool round rejected");
+            Err(
+                "Provider returned malformed tool arguments (expected a JSON object). The entire tool round was rejected before execution; retry the request.",
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DroppedToolCallReason {
     EmptyName,

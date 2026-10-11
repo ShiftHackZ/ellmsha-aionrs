@@ -7,8 +7,90 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
+    use crate::transport::{McpError, McpTransport};
     use aion_config::config::TransportType;
     use serde_json::json;
+
+    struct ToolResultTransport {
+        result: Value,
+    }
+
+    #[async_trait]
+    impl McpTransport for ToolResultTransport {
+        async fn request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
+            assert_eq!(request.method, "tools/call");
+            assert_eq!(request.params, Some(json!({"name": "test_tool", "arguments": {}})));
+            if let Some(error) = self.result.get("error") {
+                return Err(McpError::JsonRpc {
+                    code: error["code"].as_i64().unwrap(),
+                    message: error["message"].as_str().unwrap().to_owned(),
+                });
+            }
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result: Some(self.result.clone()),
+                error: None,
+            })
+        }
+
+        async fn notify(&self, _: &JsonRpcRequest) -> Result<(), McpError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_preserves_mcp_error_flags_and_rpc_failures() {
+        // This is the installed Tencent MCP validation-result shape. Its error
+        // flag must survive the manager/proxy path into agent error accounting.
+        let validation_error = "MCP error -32602: Input validation error: Required query";
+        let cases = [
+            (
+                json!({"content": [{"type": "text", "text": validation_error}], "isError": true}),
+                true,
+                validation_error,
+            ),
+            (
+                json!({"content": [{"type": "text", "text": "ok"}], "isError": false}),
+                false,
+                "ok",
+            ),
+            (
+                json!({"content": [{"type": "text", "text": "legacy ok"}]}),
+                false,
+                "legacy ok",
+            ),
+            (
+                json!({"error": {"code": -32602, "message": "Invalid arguments"}}),
+                true,
+                "JSON-RPC error -32602",
+            ),
+        ];
+        for (result, expected_error, expected_text) in cases {
+            let manager = Arc::new(McpManager::new_for_test(vec![(
+                "test_server",
+                false,
+                Box::new(ToolResultTransport { result }),
+            )]));
+            let proxy = McpToolProxy::new(
+                "test_tool".into(),
+                "test_tool".into(),
+                "test_server".into(),
+                "Test tool".into(),
+                json!({"type": "object"}),
+                manager,
+                false,
+            );
+            let result = proxy.execute(json!({})).await;
+            assert_eq!(result.is_error, expected_error);
+            assert!(result.content.contains(expected_text));
+        }
+    }
 
     fn make_proxy(deferred: bool) -> McpToolProxy {
         // manager is only used during execute(), which we don't call in these
