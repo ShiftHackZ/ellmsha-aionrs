@@ -19,6 +19,7 @@ fn anthropic_api_key() -> Option<String> {
 fn anthropic_config(api_key: &str) -> Config {
     Config {
         provider: ProviderType::Anthropic,
+        isolated_session: false,
         provider_label: "anthropic".to_string(),
         api_key: api_key.to_string(),
         base_url: "https://api.anthropic.com".to_string(),

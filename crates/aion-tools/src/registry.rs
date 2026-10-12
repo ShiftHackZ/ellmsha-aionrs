@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet};
+
 use aion_types::tool::ToolDef;
 
-use crate::Tool;
+use crate::{Tool, ToolDocumentation};
 
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
@@ -18,6 +20,18 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
+    }
+
+    /// Remove only the names owned by a refreshed catalog. Call between model turns.
+    pub fn remove_names(&mut self, names: &HashSet<String>) {
+        self.tools.retain(|tool| !names.contains(tool.name()));
+    }
+
+    pub fn documentation(&self) -> HashMap<String, ToolDocumentation> {
+        self.tools
+            .iter()
+            .filter_map(|tool| tool.documentation().map(|doc| (tool.name().to_string(), doc)))
+            .collect()
     }
 
     /// Find a tool by name

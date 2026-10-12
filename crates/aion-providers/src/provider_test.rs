@@ -69,6 +69,7 @@ mod tests {
         };
 
         Config {
+            isolated_session: false,
             provider_label: provider_label.to_string(),
             provider,
             api_key: api_key.to_string(),

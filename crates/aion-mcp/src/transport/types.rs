@@ -11,6 +11,11 @@ pub trait McpTransport: Send + Sync {
     /// Send a notification (no response expected)
     async fn notify(&self, req: &JsonRpcRequest) -> Result<(), McpError>;
 
+    /// Consume a server tools/list_changed notification, if supported by this transport.
+    fn take_tools_changed(&self) -> bool {
+        false
+    }
+
     /// Close the transport
     async fn close(&self) -> Result<(), McpError>;
 }

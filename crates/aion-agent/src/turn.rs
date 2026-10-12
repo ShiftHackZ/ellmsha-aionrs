@@ -37,7 +37,6 @@ pub(crate) enum FinalizationReason {
     TurnBudget,
     ToolFailure,
     MaxTokens,
-    EmptyFinal,
 }
 
 impl FinalizationReason {
@@ -52,7 +51,6 @@ impl FinalizationReason {
             FinalizationReason::MaxTokens => {
                 "The response was cut off by the token limit and could not be completed automatically."
             }
-            FinalizationReason::EmptyFinal => "The model finished without visible answer text after one retry.",
         }
     }
 }
@@ -60,6 +58,7 @@ impl FinalizationReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnKind {
     Normal,
+    EmptyFinalRecovery,
     Finalization(FinalizationReason),
 }
 
@@ -80,8 +79,8 @@ impl TurnKind {
             Self::Finalization(FinalizationReason::MaxTokens) => Some(
                 "The previous response was cut off by the token limit. Finish the answer now. Do not call any tools.",
             ),
-            Self::Finalization(FinalizationReason::EmptyFinal) => Some(
-                "The previous assistant response finished without visible answer text. Provide a concise visible answer now. Do not send reasoning only. Do not call any tools.",
+            Self::EmptyFinalRecovery => Some(
+                "The previous response ended without visible answer text or tool calls. Continue the unfinished task using the available tools when needed, or give a visible answer supported by the results already obtained. Do not repeat completed tool calls or claim unperformed actions. Do not send reasoning only.",
             ),
         }
     }
@@ -92,7 +91,7 @@ impl TurnKind {
             Self::Finalization(FinalizationReason::TurnBudget) => "turn_budget_finalization",
             Self::Finalization(FinalizationReason::ToolFailure) => "tool_failure_finalization",
             Self::Finalization(FinalizationReason::MaxTokens) => "max_tokens_finalization",
-            Self::Finalization(FinalizationReason::EmptyFinal) => "empty_final_retry",
+            Self::EmptyFinalRecovery => "empty_final_recovery",
         }
     }
 }

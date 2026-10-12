@@ -453,3 +453,18 @@ In `--json-stream` mode, the compaction level can be changed at runtime via `set
 ```json
 {"type": "set_config", "compaction": "full"}
 ```
+
+## Host-isolated native sessions
+
+Embedded hosts can use `Config::resolve_isolated(&CliArgs)` to start from defaults
+and explicit provider arguments instead of global or project `.aionrs.toml`.
+The host supplies an explicit API key (including an empty key for a local endpoint)
+and then assigns the exact session MCP selection to `config.mcp.servers`. Named
+ambient profiles are unavailable. `Config::resolve` retains its ordinary behavior.
+
+The runtime `isolated_session` flag skips automatic AGENTS.md discovery, all skill
+loading and the Skill tool, and automatic memory instructions. Spawned children
+and forks inherit the flag and selected MCP configuration. Explicit session prompts
+and normal workspace tools remain available. This isolates ambient context and MCP
+catalogs; it is **not an OS filesystem or network sandbox**. A selected MCP server
+retains its own capabilities and permission boundaries.

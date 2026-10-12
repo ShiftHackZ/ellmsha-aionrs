@@ -51,7 +51,7 @@ pub struct JsonRpcError {
 }
 
 /// MCP tool definition returned by tools/list
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct McpToolDef {
     pub name: String,
     pub description: Option<String>,
@@ -118,12 +118,17 @@ pub struct InitializeResult {
     #[serde(rename = "serverInfo")]
     #[allow(dead_code)]
     pub server_info: Option<Value>,
+    /// Server-owned integration documentation, never a system policy.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 /// Tools list response
 #[derive(Debug, Deserialize)]
 pub struct ToolsListResult {
     pub tools: Vec<McpToolDef>,
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
 }
 
 /// MCP resource definition returned by resources/list

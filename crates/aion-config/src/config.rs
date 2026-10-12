@@ -265,6 +265,9 @@ fn resolve_max_turns(configured: Option<usize>) -> Option<usize> {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Host-selected session scope: no ambient config, instructions, skills or memory.
+    /// Explicitly supplied MCP servers remain available. This is not a filesystem sandbox.
+    pub isolated_session: bool,
     pub provider_label: String,
     pub provider: ProviderType,
     pub api_key: String,
@@ -339,8 +342,18 @@ impl Config {
         let project = load_config_file(&project_path);
 
         // 3. Merge: global <- project
-        let mut merged = merge_config_files(global, project);
+        Self::resolve_config(cli, merge_config_files(global, project), false)
+    }
 
+    /// Resolve a host-owned session from defaults and explicit arguments only.
+    /// Never read global/project config or OAuth credentials; the host must supply
+    /// its provider key (an explicit empty key is allowed for unauthenticated endpoints).
+    /// The host can then populate `mcp.servers` with its exact session selection.
+    pub fn resolve_isolated(cli: &CliArgs) -> anyhow::Result<Self> {
+        Self::resolve_config(cli, ConfigFile::default(), true)
+    }
+
+    fn resolve_config(cli: &CliArgs, mut merged: ConfigFile, isolated_session: bool) -> anyhow::Result<Self> {
         // 4. If --profile specified, overlay profile settings
         if let Some(profile_name) = &cli.profile {
             merged = apply_profile(merged, profile_name)?;
@@ -389,7 +402,13 @@ impl Config {
         let system_prompt = cli.system_prompt.clone().or(merged.default.system_prompt.clone());
 
         // 6. Resolve API key: CLI > config file > env var
-        let api_key = resolve_api_key(cli.api_key.as_deref(), provider_config.api_key.as_deref(), provider)?;
+        let api_key = if isolated_session {
+            cli.api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Isolated sessions require an explicit provider key"))?
+        } else {
+            resolve_api_key(cli.api_key.as_deref(), provider_config.api_key.as_deref(), provider)?
+        };
 
         // 7. Apply auto_approve from CLI
         let mut tools = merged.tools;
@@ -416,6 +435,7 @@ impl Config {
         let thinking = resolve_cli_thinking(cli.thinking.as_deref(), cli.thinking_budget)?;
 
         Ok(Config {
+            isolated_session,
             provider_label,
             provider,
             api_key,
@@ -1058,3 +1078,7 @@ max_sessions = 20                # auto-cleanup oldest
 #[cfg(test)]
 #[path = "config_test.rs"]
 mod config_test;
+
+#[cfg(test)]
+#[path = "config_isolation_test.rs"]
+mod config_isolation_test;

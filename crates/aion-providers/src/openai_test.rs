@@ -6,6 +6,38 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn reasoning_alias_uses_one_nonempty_field_per_chunk() {
+        for (delta, expected) in [
+            (json!({"reasoning": "alias"}), Some("alias")),
+            (
+                json!({"reasoning_content": "canonical", "reasoning": "alias"}),
+                Some("canonical"),
+            ),
+            (json!({"reasoning_content": "", "reasoning": "alias"}), Some("alias")),
+            (json!({"reasoning_content": null, "reasoning": "alias"}), Some("alias")),
+            (
+                json!({"reasoning_content": "canonical", "reasoning": ""}),
+                Some("canonical"),
+            ),
+            (json!({"reasoning_content": "", "reasoning": ""}), None),
+            (
+                json!({"reasoning_content": null, "reasoning": {"text": "not a delta"}}),
+                None,
+            ),
+        ] {
+            let mut state = StreamState::new();
+            let chunk = json!({"choices": [{"delta": delta}]});
+            let events = parse_sse_chunk(&chunk.to_string(), &mut state, false);
+            match expected {
+                Some(expected) => assert!(matches!(
+                    events.as_slice(), [LlmEvent::ThinkingDelta(text)] if text == expected
+                )),
+                None => assert!(events.is_empty()),
+            }
+        }
+    }
+
+    #[test]
     fn malformed_arguments_reject_entire_tool_round_without_fabricating_empty_input() {
         for invalid in ["", "{\"query\":", "[1]", "null"] {
             let mut state = StreamState::new();

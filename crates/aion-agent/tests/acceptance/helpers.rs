@@ -62,6 +62,7 @@ macro_rules! skip_if_no_bedrock {
 pub fn openai_config(api_key: &str) -> Config {
     Config {
         provider: ProviderType::OpenAI,
+        isolated_session: false,
         provider_label: "openai".to_string(),
         api_key: api_key.to_string(),
         base_url: "https://api.openai.com/v1".to_string(),
@@ -100,6 +101,7 @@ pub fn openai_config(api_key: &str) -> Config {
 pub fn bedrock_config() -> Config {
     Config {
         provider: ProviderType::Bedrock,
+        isolated_session: false,
         provider_label: "bedrock".to_string(),
         api_key: String::new(), // Bedrock uses AWS credentials, not API key
         base_url: String::new(),

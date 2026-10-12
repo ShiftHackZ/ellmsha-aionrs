@@ -17,6 +17,8 @@ use crate::tool_policy::ToolPolicy;
 /// independently. The `joined` field holds the pre-joined full prompt string
 /// and is invalidated whenever any section changes.
 pub struct SystemPromptCache {
+    /// Fixed for this cache's lifetime, including after compaction invalidation.
+    load_ambient_instructions: bool,
     /// Cached section strings, keyed by section name.
     pub(crate) sections: HashMap<&'static str, String>,
     /// Pre-joined full prompt. Invalidated on any section change.
@@ -34,12 +36,20 @@ pub struct SystemPromptCache {
 impl SystemPromptCache {
     pub fn new() -> Self {
         Self {
+            load_ambient_instructions: true,
             sections: HashMap::new(),
             joined: None,
             last_plan_mode: false,
             last_toon_enabled: false,
             last_shell_prompt: None,
             last_tool_policy: ToolPolicy::default(),
+        }
+    }
+
+    pub(crate) fn isolated() -> Self {
+        Self {
+            load_ambient_instructions: false,
+            ..Self::new()
         }
     }
 
@@ -271,6 +281,9 @@ pub(crate) fn build_system_prompt_with_shell_and_tool_policy(
 
     // Section: AGENTS.md (session permanent, hierarchical)
     let agents_section = cache.sections.entry("agents_md").or_insert_with(|| {
+        if !cache.load_ambient_instructions {
+            return String::new();
+        }
         let files = agents_md::collect_agents_md(cwd);
         agents_md::format_agents_md_section(&files)
     });

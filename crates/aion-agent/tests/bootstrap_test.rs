@@ -7,6 +7,7 @@ use aion_config::config::{Config, ProviderType};
 
 fn minimal_config() -> Config {
     Config {
+        isolated_session: false,
         provider_label: "openai".into(),
         provider: ProviderType::OpenAI,
         api_key: "sk-test".into(),

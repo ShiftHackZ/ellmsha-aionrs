@@ -9,6 +9,7 @@ use aion_agent::output::terminal::TerminalSink;
 use aion_agent::session::SessionManager;
 use aion_providers::{LlmProvider, ProviderError};
 use aion_tools::registry::ToolRegistry;
+use aion_tools::write::WriteTool;
 use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use async_trait::async_trait;
@@ -64,6 +65,7 @@ fn tool_call_failure_turn(id: &str) -> Vec<LlmEvent> {
 struct RecordingOutputSink {
     tool_calls: Mutex<Vec<(String, String)>>,
     tool_results: Mutex<Vec<(String, String, bool)>>,
+    errors: Mutex<Vec<String>>,
 }
 
 impl OutputSink for RecordingOutputSink {
@@ -95,7 +97,9 @@ impl OutputSink for RecordingOutputSink {
         _cache_read_tokens: u64,
     ) {
     }
-    fn emit_error(&self, _msg: &str) {}
+    fn emit_error(&self, msg: &str) {
+        self.errors.lock().unwrap().push(msg.to_owned());
+    }
     fn emit_info(&self, _msg: &str) {}
 }
 
@@ -446,7 +450,7 @@ async fn test_engine_max_tokens_handling() {
 }
 
 #[tokio::test]
-async fn empty_final_gets_one_visible_answer_nudge() {
+async fn empty_final_gets_one_counted_recovery_with_tools() {
     let provider = Arc::new(FullRecordingRequestProvider::new(vec![
         vec![LlmEvent::Done {
             stop_reason: StopReason::EndTurn,
@@ -472,31 +476,82 @@ async fn empty_final_gets_one_visible_answer_nudge() {
 
     assert_eq!(result.text, "Visible answer");
     assert_eq!(result.stop_reason, StopReason::EndTurn);
-    assert_eq!(result.turns, 1);
+    assert_eq!(result.turns, 2);
 
     let recorded = requests.lock().unwrap();
     assert_eq!(recorded.len(), 2);
-    assert_eq!(recorded[1].tool_count, 0);
+    assert!(recorded[1].tool_count > 0);
     assert!(
         !contains_empty_assistant_message(&recorded[1].messages),
-        "empty finalization request must not include empty assistant content"
+        "recovery request must not include empty assistant content"
     );
     let last_message = recorded[1]
         .messages
         .last()
-        .expect("finalization request should include control prompt");
+        .expect("recovery request should include control prompt");
     assert_eq!(last_message.role, Role::User);
     assert!(
         matches!(
             &last_message.content[..],
             [ContentBlock::Text { text }] if text.contains("visible answer text")
         ),
-        "empty finalization prompt should ask for visible answer text"
+        "recovery prompt should explain the empty answer"
     );
 }
 
 #[tokio::test]
-async fn empty_final_falls_back_after_one_empty_retry() {
+async fn turn_budget_finalization_tool_call_is_terminalized_without_execution() {
+    let dir = tempdir().expect("tempdir should be created");
+    let forbidden_output = dir.path().join("must-not-be-written.txt");
+    let provider = Arc::new(FullRecordingRequestProvider::new(vec![
+        tool_call_failure_turn("allowed-tool"),
+        tool_call_malformed_turn(
+            "retry-tool",
+            "Write",
+            json!({"file_path": forbidden_output, "content": "must not execute"}),
+        ),
+    ]));
+    let requests = provider.requests();
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(MockTool::new("mock_tool", "completed", false)));
+    registry.register(Box::new(WriteTool::new(None)));
+    let output = Arc::new(RecordingOutputSink::default());
+    let mut config = test_config();
+    config.max_turns = Some(1);
+    let mut engine =
+        AgentEngine::new_with_provider(provider, config, registry, output.clone(), dir.path().to_path_buf());
+
+    let result = engine.run("Answer visibly", "").await.expect("bounded fallback");
+
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 2, "finalization must remain bounded to one retry");
+    assert!(recorded[0].tool_count > 0);
+    assert_eq!(recorded[1].tool_count, 0, "retry must disable tools");
+    assert!(!forbidden_output.exists(), "disallowed retry tool must never execute");
+    assert_eq!(
+        *output.tool_calls.lock().unwrap(),
+        vec![
+            ("allowed-tool".to_string(), "mock_tool".to_string()),
+            ("retry-tool".to_string(), "Write".to_string()),
+        ]
+    );
+    assert_eq!(
+        *output.tool_results.lock().unwrap(),
+        vec![
+            ("allowed-tool".to_string(), "mock_tool".to_string(), false),
+            ("retry-tool".to_string(), "Write".to_string(), true),
+        ],
+        "every announced retry call must receive its terminal error"
+    );
+    let fallback = "Stopped after reaching the turn budget before the model produced a final answer.";
+    assert_eq!(*output.errors.lock().unwrap(), vec![fallback.to_string()]);
+    assert_eq!(result.text, fallback);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
+    assert_eq!(result.turns, 1);
+}
+
+#[tokio::test]
+async fn empty_final_fails_after_one_empty_retry() {
     let dir = tempdir().expect("tempdir should be created");
     let provider = Arc::new(FullRecordingRequestProvider::new(vec![
         vec![LlmEvent::Done {
@@ -509,7 +564,9 @@ async fn empty_final_falls_back_after_one_empty_retry() {
         }],
     ]));
 
+    let requests = provider.requests();
     let mut config = test_config();
+    config.max_turns = None;
     config.session.enabled = true;
     config.session.directory = dir.path().to_string_lossy().into_owned();
     let registry = ToolRegistry::new();
@@ -519,34 +576,147 @@ async fn empty_final_falls_back_after_one_empty_retry() {
     engine
         .init_session("test-provider", "/tmp", None)
         .expect("init_session should succeed");
-    let result = engine
+    let error = engine
         .run("Answer visibly", "")
         .await
-        .expect("engine should fall back successfully");
+        .expect_err("repeated empty response must fail, even without a turn budget");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
-    assert_eq!(result.turns, 1);
-    assert!(result.text.contains("finished without visible answer text"));
+    assert!(matches!(error, AgentError::ApiError(ref text) if text.contains("task may be incomplete")));
+    assert_eq!(requests.lock().unwrap().len(), 2);
 
     let session = SessionManager::new(dir.path().to_path_buf(), 10)
         .load("latest")
         .expect("session should be loadable");
     assert!(
         !contains_empty_assistant_message(&session.messages),
-        "empty finalization fallback must not persist empty assistant content"
+        "empty recovery failure must not persist empty assistant content"
     );
 
-    let last_message = session
-        .messages
-        .last()
-        .expect("fallback assistant message should be persisted");
-    assert_eq!(last_message.role, Role::Assistant);
-    assert!(
-        matches!(
-            &last_message.content[..],
-            [ContentBlock::Text { text }] if text == &result.text
-        ),
-        "fallback assistant message should be text-only"
+    let last_message = session.messages.last().expect("user message should remain persisted");
+    assert_eq!(last_message.role, Role::User);
+}
+
+#[tokio::test]
+async fn empty_final_recovery_continues_without_replay_and_is_not_reset_by_tools() {
+    // A successful intervening tool must not replenish the single recovery allowance.
+    for final_is_empty in [false, true] {
+        let done = LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        };
+        let last = if final_is_empty {
+            vec![done.clone()]
+        } else {
+            vec![
+                LlmEvent::TextDelta("Both operations verified".to_string()),
+                done.clone(),
+            ]
+        };
+        let provider = Arc::new(FullRecordingRequestProvider::new(vec![
+            tool_call_failure_turn("completed-before-empty"),
+            vec![LlmEvent::ThinkingDelta("synthetic thinking".to_string()), done],
+            tool_call_failure_turn("remaining-operation"),
+            last,
+        ]));
+        let requests = provider.requests();
+        let mut config = test_config();
+        config.max_turns = Some(4);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("mock_tool", "completed", false)));
+        let output = Arc::new(RecordingOutputSink::default());
+        let mut engine =
+            AgentEngine::new_with_provider(provider, config, registry, output.clone(), std::env::temp_dir());
+
+        let result = engine.run("Complete both operations", "recovery-test").await;
+        if final_is_empty {
+            assert!(matches!(result, Err(AgentError::ApiError(ref text)) if text.contains("one recovery attempt")));
+        } else {
+            let result = result.expect("remaining operation and final answer should complete");
+            assert_eq!(result.text, "Both operations verified");
+            assert_eq!(result.turns, 4, "the empty turn and recovery both consume budget");
+        }
+        assert_eq!(
+            *output.tool_results.lock().unwrap(),
+            vec![
+                ("completed-before-empty".to_string(), "mock_tool".to_string(), false),
+                ("remaining-operation".to_string(), "mock_tool".to_string(), false),
+            ],
+            "each requested call executes once; recovery does not replay previous calls"
+        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 4);
+        assert!(recorded.iter().all(|request| request.tool_count > 0));
+        assert!(recorded[2].messages.last().unwrap().content.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text } if text.contains("Continue the unfinished task"))
+        }));
+        assert!(
+            !recorded[3].messages.iter().flat_map(|msg| &msg.content).any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains("Continue the unfinished task"))
+            }),
+            "the recovery control prompt is transient"
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_final_at_turn_budget_does_not_make_a_recovery_request() {
+    let provider = Arc::new(FullRecordingRequestProvider::new(vec![vec![LlmEvent::Done {
+        stop_reason: StopReason::EndTurn,
+        usage: TokenUsage::default(),
+    }]]));
+    let requests = provider.requests();
+    let mut config = test_config();
+    config.max_turns = Some(1);
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(MockTool::new("mock_tool", "must not execute", false)));
+    let output = Arc::new(RecordingOutputSink::default());
+    let mut engine = AgentEngine::new_with_provider(provider, config, registry, output.clone(), std::env::temp_dir());
+
+    let result = engine.run("Continue if possible", "budget-test").await.unwrap();
+
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
+    assert_eq!(result.turns, 1);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(output.tool_calls.lock().unwrap().is_empty());
+    assert!(output.tool_results.lock().unwrap().is_empty());
+    assert!(output.errors.lock().unwrap()[0].contains("max_turns=1"));
+}
+
+#[tokio::test]
+async fn empty_final_recovery_tool_consumes_last_turn_then_finalizes_without_tools() {
+    let done = LlmEvent::Done {
+        stop_reason: StopReason::EndTurn,
+        usage: TokenUsage::default(),
+    };
+    let provider = Arc::new(FullRecordingRequestProvider::new(vec![
+        vec![done.clone()],
+        tool_call_failure_turn("last-allowed-operation"),
+        vec![
+            LlmEvent::TextDelta("Only the allowed operation completed".to_string()),
+            done,
+        ],
+    ]));
+    let requests = provider.requests();
+    let mut config = test_config();
+    config.max_turns = Some(2);
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(MockTool::new("mock_tool", "completed", false)));
+    let output = Arc::new(RecordingOutputSink::default());
+    let mut engine = AgentEngine::new_with_provider(provider, config, registry, output.clone(), std::env::temp_dir());
+
+    let result = engine
+        .run("Perform the remaining operation", "last-turn-test")
+        .await
+        .unwrap();
+
+    assert_eq!(result.turns, 2);
+    assert_eq!(output.tool_results.lock().unwrap().len(), 1);
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 3);
+    assert!(recorded[1].tool_count > 0);
+    assert_eq!(
+        recorded[2].tool_count, 0,
+        "the original budget still forces no-tools finalization"
     );
 }
 

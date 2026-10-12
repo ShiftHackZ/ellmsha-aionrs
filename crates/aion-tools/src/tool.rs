@@ -39,6 +39,13 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Untrusted integration documentation supplied alongside discovered tools.
+#[derive(Debug, Clone)]
+pub struct ToolDocumentation {
+    pub source: String,
+    pub content: String,
+}
+
 /// A tool that the agent can invoke
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -50,6 +57,11 @@ pub trait Tool: Send + Sync {
 
     /// JSON Schema for input parameters
     fn input_schema(&self) -> JsonSchema;
+
+    /// Integration documentation loaded by ToolSearch, never injected as system instructions.
+    fn documentation(&self) -> Option<ToolDocumentation> {
+        None
+    }
 
     /// Whether this tool is safe to run concurrently
     fn is_concurrency_safe(&self, input: &Value) -> bool;

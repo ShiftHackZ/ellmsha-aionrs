@@ -235,6 +235,7 @@ impl Tool for ExecMockTool {
 
 pub fn test_config() -> Config {
     Config {
+        isolated_session: false,
         provider_label: "anthropic".to_string(),
         provider: ProviderType::Anthropic,
         api_key: "test-key".to_string(),

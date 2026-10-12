@@ -857,6 +857,29 @@ mod tests {
     }
 
     #[test]
+    fn isolated_prompt_cache_does_not_reload_ambient_instructions_after_invalidation() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "AMBIENT_MARKER").unwrap();
+        let mut cache = SystemPromptCache::isolated();
+        for _ in 0..2 {
+            let prompt = build_system_prompt(
+                &mut cache,
+                Some("EXPLICIT_MARKER"),
+                &workspace.path().to_string_lossy(),
+                "fixture-model",
+                &[],
+                None,
+                None,
+                false,
+                false,
+            );
+            assert!(prompt.contains("EXPLICIT_MARKER"));
+            assert!(!prompt.contains("AMBIENT_MARKER"));
+            cache.invalidate_all();
+        }
+    }
+
+    #[test]
     fn changing_tool_policy_invalidates_cached_guidance() {
         let mut cache = SystemPromptCache::new();
         let shell = default_shell();

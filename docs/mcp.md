@@ -73,8 +73,8 @@ deferred = true    # Don't load tool schemas at startup
 
 | `deferred` | Behavior |
 |------------|----------|
-| `false` (default for config servers) | Tool schemas included in system prompt at startup |
-| `true` | Tools registered but schemas loaded on-demand via ToolSearch |
+| `false` | Tool schemas included in system prompt at startup |
+| `true` (default) | Tools registered but schemas loaded on-demand via ToolSearch |
 
 Use `deferred = true` for MCP servers with many tools to keep the initial system prompt small.
 
@@ -90,3 +90,29 @@ Use `deferred = true` for MCP servers with many tools to keep the initial system
 3. Discover available tools (`tools/list`)
 4. Register tools in the tool registry — the agent uses them like built-in tools
 5. Gracefully close all connections on exit
+
+## Scoped Integration Documentation and Catalog Refresh
+
+The native runtime retains optional `initialize.instructions` as server-provided
+**tool documentation**, not system policy. `ToolSearch` returns documentation only
+for matching, policy-allowed tools, once per integration in each result. Search by
+a tool name, integration name, or documentation keyword. The default result page
+contains 10 schemas (maximum 25); use `next_offset` to continue. Documentation is
+bounded to 8 KB per integration and 16 KB per result, with truncation indicated.
+Repeated searches do not append documentation to the system prompt. Servers that
+omit instructions continue to work unchanged.
+
+`tools/list` follows up to 64 pages / 4,096 tools, rejecting repeated cursors and
+duplicate names rather than accepting a partial catalog. Between completed model
+rounds, a tools-changed notification or a 60-second TTL triggers discovery. Servers
+refresh concurrently with a three-second total budget per server; a failed refresh
+retains its last complete catalog. Successful refreshes replace removed tools and
+changed schemas in the existing registry and rebuild the filtered ToolSearch
+snapshot. A compact schema revision remains visible in deferred descriptions, so
+the model can reload schemas that differ from earlier ToolSearch results. Active tool calls are never interrupted for refresh.
+
+The TTL covers Streamable HTTP without an idle notification stream and buffered
+stdio notifications. There is no background polling or automatic server restart.
+New connections obtain their own instructions; changing initialization instructions
+requires reconnecting the server. External agent clients manage their own MCP
+catalogs separately.

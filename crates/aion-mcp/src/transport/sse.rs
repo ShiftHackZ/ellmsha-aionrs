@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -19,6 +19,7 @@ pub struct SseTransport {
     /// Pending request-response channels, keyed by JSON-RPC id
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
     next_id: AtomicU64,
+    tools_changed: Arc<AtomicBool>,
     /// Handle to the background SSE listener task
     _listener: tokio::task::JoinHandle<()>,
 }
@@ -99,6 +100,8 @@ impl SseTransport {
 
         // Spawn background task to listen for SSE responses
         let pending_clone = pending.clone();
+        let tools_changed = Arc::new(AtomicBool::new(false));
+        let tools_changed_listener = tools_changed.clone();
         let listener = tokio::spawn(async move {
             let mut buf = buffer; // carry over remaining buffer
             while let Some(chunk) = bytes_stream.next().await {
@@ -111,6 +114,11 @@ impl SseTransport {
 
                     let (event_type, event_data) = parse_sse_event(&event_block);
 
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event_data)
+                        && value["method"] == "notifications/tools/list_changed"
+                    {
+                        tools_changed_listener.store(true, Ordering::Release);
+                    }
                     if (event_type == "message" || event_type.is_empty())
                         && let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&event_data)
                         && let Some(id) = response.id
@@ -131,6 +139,7 @@ impl SseTransport {
             headers: header_map,
             pending,
             next_id: AtomicU64::new(1),
+            tools_changed,
             _listener: listener,
         })
     }
@@ -152,6 +161,8 @@ impl McpTransport for SseTransport {
         {
             let mut map: tokio::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<JsonRpcResponse>>> =
                 self.pending.lock().await;
+            // Timed-out receivers are closed; do not retain abandoned refresh requests.
+            map.retain(|_, sender| !sender.is_closed());
             map.insert(req_id, tx);
         }
 
@@ -207,6 +218,10 @@ impl McpTransport for SseTransport {
             .map_err(|e| McpError::Transport(format!("Notification POST failed: {}", e)))?;
 
         Ok(())
+    }
+
+    fn take_tools_changed(&self) -> bool {
+        self.tools_changed.swap(false, Ordering::AcqRel)
     }
 
     async fn close(&self) -> Result<(), McpError> {

@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use aion_tools::{ToolDocumentation, truncate_utf8};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use aion_types::tool::ToolResult;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -18,13 +20,18 @@ use super::transport::streamable_http::StreamableHttpTransport;
 use super::transport::{McpError, McpTransport};
 
 const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 30_000;
+const MAX_TOOL_PAGES: usize = 64;
+const MAX_TOOLS: usize = 4096;
+const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const CATALOG_REFRESH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A connected MCP server with its discovered tools and capabilities
 struct McpServer {
     #[allow(dead_code)]
     name: String,
     transport: Box<dyn McpTransport>,
-    tools: Vec<McpToolDef>,
+    tools: RwLock<Vec<McpToolDef>>,
+    instructions: Option<String>,
     /// Whether the server declared resources capability in its initialize response
     supports_resources: bool,
 }
@@ -34,6 +41,7 @@ pub struct McpManager {
     servers: HashMap<String, McpServer>,
     /// Monotonically increasing request ID counter for all JSON-RPC calls
     next_id: AtomicU64,
+    last_refresh: Mutex<Instant>,
 }
 
 impl McpManager {
@@ -69,7 +77,7 @@ impl McpManager {
         while let Some((name, result)) = pending.next().await {
             match result {
                 Ok(server) => {
-                    tracing::info!(target: "aion_mcp", server = %name, tools = server.tools.len(), resources = server.supports_resources, "mcp server connected");
+                    tracing::info!(target: "aion_mcp", server = %name, tools = server.tools.read().unwrap_or_else(|error| error.into_inner()).len(), resources = server.supports_resources, "mcp server connected");
                     servers.insert(name, server);
                 }
                 Err(e) => {
@@ -82,6 +90,7 @@ impl McpManager {
         Ok(Self {
             servers,
             next_id: AtomicU64::new(10),
+            last_refresh: Mutex::new(Instant::now()),
         })
     }
 
@@ -111,8 +120,14 @@ impl McpManager {
     /// Returns the list of tool names exposed by the server.
     pub async fn connect_one(&mut self, name: String, config: &McpServerConfig) -> Result<Vec<String>, McpError> {
         let server = Self::with_startup_timeout(&name, config, Self::connect_server(&name, config)).await?;
-        let tool_names: Vec<String> = server.tools.iter().map(|t| t.name.clone()).collect();
-        tracing::info!(target: "aion_mcp", server = %name, tools = server.tools.len(), resources = server.supports_resources, "mcp server connected");
+        let tool_names: Vec<String> = server
+            .tools
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        tracing::info!(target: "aion_mcp", server = %name, tools = server.tools.read().unwrap_or_else(|error| error.into_inner()).len(), resources = server.supports_resources, "mcp server connected");
         self.servers.insert(name, server);
         Ok(tool_names)
     }
@@ -150,6 +165,10 @@ impl McpManager {
             }
         };
 
+        Self::initialize_transport(name, transport).await
+    }
+
+    async fn initialize_transport(name: &str, transport: Box<dyn McpTransport>) -> Result<McpServer, McpError> {
         // 2. Initialize handshake
         let init_params = InitializeParams {
             protocol_version: "2025-03-26".to_string(),
@@ -188,45 +207,154 @@ impl McpManager {
         let initialized_notification = JsonRpcRequest::notification("notifications/initialized", None);
         transport.notify(&initialized_notification).await?;
 
-        // 4. List tools
-        let list_req = JsonRpcRequest::new(2, "tools/list", None);
-        let list_response = transport.request(&list_req).await?;
-        let tools_result: ToolsListResult = serde_json::from_value(
-            list_response
-                .result
-                .ok_or_else(|| McpError::InitFailed("No result in tools/list response".into()))?,
-        )
-        .map_err(|e| McpError::InitFailed(format!("Failed to parse tools list: {}", e)))?;
-
+        // 4. Fully validate the catalog before publishing any tools.
+        let tools = Self::list_tools(transport.as_ref(), &AtomicU64::new(2)).await?;
+        let instructions = init_result
+            .instructions
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| truncate_utf8(&text, 16_000).to_string());
         Ok(McpServer {
             name: name.to_string(),
             transport,
-            tools: tools_result.tools,
+            tools: RwLock::new(tools),
+            instructions,
             supports_resources,
         })
     }
 
-    /// Get all discovered tools with their server names
-    pub fn all_tools(&self) -> Vec<(&str, &McpToolDef)> {
-        let mut result = Vec::new();
-        for (server_name, server) in &self.servers {
-            for tool in &server.tools {
-                result.push((server_name.as_str(), tool));
+    async fn list_tools(transport: &dyn McpTransport, next_id: &AtomicU64) -> Result<Vec<McpToolDef>, McpError> {
+        let mut tools = Vec::new();
+        let mut names = HashSet::new();
+        let mut cursors = HashSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_PAGES {
+            let params = cursor.as_ref().map(|cursor| json!({"cursor": cursor}));
+            let response = transport
+                .request(&JsonRpcRequest::new(
+                    next_id.fetch_add(1, Ordering::Relaxed),
+                    "tools/list",
+                    params,
+                ))
+                .await?;
+            if let Some(error) = response.error {
+                return Err(McpError::JsonRpc {
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+            let page: ToolsListResult = serde_json::from_value(
+                response
+                    .result
+                    .ok_or_else(|| McpError::InitFailed("No result in tools/list response".into()))?,
+            )
+            .map_err(|error| McpError::InitFailed(format!("Invalid tools/list response: {error}")))?;
+            for tool in page.tools {
+                if tool.name.trim().is_empty() || !names.insert(tool.name.clone()) {
+                    return Err(McpError::InitFailed(
+                        "Empty or duplicate tool name in tools/list".into(),
+                    ));
+                }
+                tools.push(tool);
+                if tools.len() > MAX_TOOLS {
+                    return Err(McpError::InitFailed("MCP tool catalog exceeds supported size".into()));
+                }
+            }
+            match page.next_cursor {
+                None => {
+                    tools.sort_by(|a, b| a.name.cmp(&b.name));
+                    return Ok(tools);
+                }
+                Some(next) if cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Err(McpError::InitFailed("Repeated tools/list cursor".into())),
             }
         }
+        Err(McpError::InitFailed("MCP tools/list pagination limit exceeded".into()))
+    }
+
+    /// Refresh at an idle model-turn boundary. Never changes a catalog during tool execution.
+    /// Notification flags avoid polling; the TTL also covers transports without an idle event stream.
+    /// Failed/partial refreshes retain the last complete snapshot and retry after the TTL.
+    pub async fn refresh_tools_if_due(&self) -> bool {
+        let mut notified = false;
+        for server in self.servers.values() {
+            notified |= server.transport.take_tools_changed();
+        }
+        {
+            let mut last = self.last_refresh.lock().unwrap_or_else(|error| error.into_inner());
+            if !notified && last.elapsed() < CATALOG_REFRESH_INTERVAL {
+                return false;
+            }
+            *last = Instant::now();
+        }
+        let mut pending = FuturesUnordered::new();
+        for (name, server) in &self.servers {
+            pending.push(async move {
+                (
+                    name,
+                    server,
+                    tokio::time::timeout(
+                        CATALOG_REFRESH_TIMEOUT,
+                        Self::list_tools(server.transport.as_ref(), &self.next_id),
+                    )
+                    .await,
+                )
+            });
+        }
+        let mut changed = false;
+        while let Some((name, server, result)) = pending.next().await {
+            match result {
+                Ok(Ok(tools)) => {
+                    let mut current = server.tools.write().unwrap_or_else(|error| error.into_inner());
+                    if *current != tools {
+                        tracing::info!(target: "aion_mcp", server = %name, tools = tools.len(), "MCP catalog refreshed");
+                        *current = tools;
+                        changed = true;
+                    }
+                }
+                _ => {
+                    tracing::warn!(target: "aion_mcp", server = %name, "MCP catalog refresh failed; retaining previous complete catalog")
+                }
+            }
+        }
+        changed
+    }
+
+    /// Snapshot discovered tools. The owned snapshot remains valid during catalog refresh.
+    pub fn all_tools(&self) -> Vec<(String, McpToolDef)> {
+        let mut result = Vec::new();
+        for (name, server) in &self.servers {
+            for tool in server.tools.read().unwrap_or_else(|error| error.into_inner()).iter() {
+                result.push((name.clone(), tool.clone()));
+            }
+        }
+        result.sort_by(|a, b| (&a.0, &a.1.name).cmp(&(&b.0, &b.1.name)));
         result
     }
 
-    /// Check if a tool name exists across any server
-    pub fn has_tool_name(&self, name: &str) -> bool {
-        self.servers.values().any(|s| s.tools.iter().any(|t| t.name == name))
+    /// Documentation belongs to this initialized connection and is not a system policy.
+    pub fn server_documentation(&self, server_name: &str) -> Option<ToolDocumentation> {
+        let content = self.servers.get(server_name)?.instructions.clone()?;
+        Some(ToolDocumentation {
+            source: server_name.to_string(),
+            content,
+        })
     }
 
-    /// Count how many servers have a tool with the given name
+    pub fn has_tool_name(&self, name: &str) -> bool {
+        self.tool_name_count(name) > 0
+    }
+
     pub fn tool_name_count(&self, name: &str) -> usize {
         self.servers
             .values()
-            .filter(|s| s.tools.iter().any(|t| t.name == name))
+            .filter(|server| {
+                server
+                    .tools
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .iter()
+                    .any(|tool| tool.name == name)
+            })
             .count()
     }
 
@@ -243,7 +371,7 @@ impl McpManager {
             .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
 
         let request = JsonRpcRequest::new(
-            0, // id doesn't matter for stdio, will be used for SSE/HTTP
+            self.next_id.fetch_add(1, Ordering::Relaxed),
             "tools/call",
             Some(json!({
                 "name": tool_name,
@@ -362,7 +490,8 @@ impl McpManager {
                 McpServer {
                     name: name.to_string(),
                     transport,
-                    tools: vec![],
+                    tools: RwLock::new(vec![]),
+                    instructions: None,
                     supports_resources,
                 },
             );
@@ -370,6 +499,7 @@ impl McpManager {
         Self {
             servers,
             next_id: AtomicU64::new(10),
+            last_refresh: Mutex::new(Instant::now()),
         }
     }
 }

@@ -13,7 +13,7 @@ use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
 use aion_config::config::{McpServerConfig, TransportType};
 use aion_mcp::manager::McpManager;
-use aion_mcp::tool_proxy::register_single_server_tools;
+use aion_mcp::tool_proxy::McpToolCatalog;
 use aion_protocol::commands::ProtocolCommand;
 use aion_protocol::events::ProtocolEvent;
 use aion_protocol::writer::{ProtocolEmitter, ProtocolWriter};
@@ -98,13 +98,13 @@ pub(super) async fn run(
                         tracing::info!(target: "aion_mcp", %name, tools = tool_names.len(), "mcp server connected");
                         let mgr_arc = Arc::new(mgr);
                         let builtin_names = engine.tool_names();
-                        register_single_server_tools(
+                        let catalog = McpToolCatalog::new(
                             engine.registry_mut(),
-                            &mgr_arc,
-                            &name,
+                            Arc::clone(&mgr_arc),
                             &builtin_names,
-                            config.deferred.unwrap_or(true),
+                            single_configs,
                         );
+                        engine.add_mcp_catalog(catalog);
                         dynamic_managers.push(mgr_arc);
                         let _ = writer.emit(&ProtocolEvent::McpReady {
                             name,

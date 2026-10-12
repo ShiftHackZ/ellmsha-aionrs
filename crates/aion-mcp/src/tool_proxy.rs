@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,7 +9,8 @@ use serde_json::Value;
 use super::config::McpServerConfig;
 use super::manager::McpManager;
 use aion_protocol::events::ToolCategory;
-use aion_tools::Tool;
+use aion_tools::registry::ToolRegistry;
+use aion_tools::{Tool, ToolDocumentation};
 use aion_types::tool::{JsonSchema, ToolResult};
 
 /// Wraps an MCP server tool as a local Tool trait implementation.
@@ -37,6 +40,21 @@ impl McpToolProxy {
         manager: Arc<McpManager>,
         deferred: bool,
     ) -> Self {
+        let documentation = manager.server_documentation(&server_name);
+        let mut revision = DefaultHasher::new();
+        input_schema.to_string().hash(&mut revision);
+        description.hash(&mut revision);
+        documentation.as_ref().map(|doc| &doc.content).hash(&mut revision);
+        // The prefix survives deferred description truncation. Old ToolSearch results in
+        // conversation history must not look current after schema/documentation changes.
+        let description = format!("[MCP {server_name}; schema {:016x}] {description}", revision.finish());
+        let description = if documentation.is_some() {
+            format!(
+                "{description}\n\nIntegration: {server_name}. Use ToolSearch to load its scoped usage documentation."
+            )
+        } else {
+            description
+        };
         Self {
             display_name,
             tool_name,
@@ -57,6 +75,10 @@ impl Tool for McpToolProxy {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn documentation(&self) -> Option<ToolDocumentation> {
+        self.manager.server_documentation(&self.server_name)
     }
 
     fn input_schema(&self) -> JsonSchema {
@@ -96,6 +118,53 @@ impl Tool for McpToolProxy {
     }
 }
 
+/// Owns registration metadata, not a second tool registry. Used only between model turns.
+pub struct McpToolCatalog {
+    manager: Arc<McpManager>,
+    configs: HashMap<String, McpServerConfig>,
+    registered_names: HashSet<String>,
+}
+
+impl McpToolCatalog {
+    pub fn new(
+        registry: &mut ToolRegistry,
+        manager: Arc<McpManager>,
+        builtin_names: &[String],
+        configs: HashMap<String, McpServerConfig>,
+    ) -> Self {
+        let existing: HashSet<_> = registry.tool_names().into_iter().collect();
+        register_mcp_tools(registry, &manager, builtin_names, &configs);
+        let registered_names = registry
+            .tool_names()
+            .into_iter()
+            .filter(|name| !existing.contains(name))
+            .collect();
+        Self {
+            manager,
+            configs,
+            registered_names,
+        }
+    }
+
+    /// Discover a replacement snapshot; callers can await multiple catalogs concurrently.
+    pub async fn refresh(&self) -> bool {
+        self.manager.refresh_tools_if_due().await
+    }
+
+    /// Apply a successfully refreshed snapshot between model turns, never during active calls.
+    pub fn apply(&mut self, registry: &mut ToolRegistry) {
+        registry.remove_names(&self.registered_names);
+        let builtin_names = registry.tool_names();
+        register_mcp_tools(registry, &self.manager, &builtin_names, &self.configs);
+        let builtin_names: HashSet<_> = builtin_names.into_iter().collect();
+        self.registered_names = registry
+            .tool_names()
+            .into_iter()
+            .filter(|name| !builtin_names.contains(name))
+            .collect();
+    }
+}
+
 /// Register all MCP tools into the tool registry, handling name collisions.
 ///
 /// Strategy:
@@ -129,10 +198,7 @@ pub fn register_mcp_tools(
         };
 
         // MCP tools are deferred by default; server config can override.
-        let deferred = server_configs
-            .get(*server_name)
-            .and_then(|c| c.deferred)
-            .unwrap_or(true);
+        let deferred = server_configs.get(server_name).and_then(|c| c.deferred).unwrap_or(true);
 
         let proxy = McpToolProxy::new(
             display_name,
@@ -158,7 +224,7 @@ pub fn register_single_server_tools(
     deferred: bool,
 ) {
     let all_tools = manager.all_tools();
-    let server_tools: Vec<_> = all_tools.iter().filter(|(sn, _)| *sn == server_name).collect();
+    let server_tools: Vec<_> = all_tools.iter().filter(|(sn, _)| sn == server_name).collect();
 
     for (_, tool_def) in &server_tools {
         let original_name = &tool_def.name;

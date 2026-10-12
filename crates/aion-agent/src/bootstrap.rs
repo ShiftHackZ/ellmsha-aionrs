@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use aion_config::config::{Config, McpServerConfig};
 use aion_config::shell::{ResolvedShell, resolve_shell_config};
 use aion_mcp::manager::McpManager;
-use aion_mcp::tool_proxy::register_mcp_tools;
+use aion_mcp::tool_proxy::McpToolCatalog;
 use aion_memory::paths::{ENTRYPOINT_NAME, auto_memory_dir};
 use aion_providers::{LlmProvider, create_provider};
 use aion_skills::loader::load_all_skills;
@@ -85,6 +85,7 @@ struct BootstrapEnvironment {
 
 #[derive(Default)]
 pub(crate) struct McpBootstrap {
+    pub(crate) catalog: Option<McpToolCatalog>,
     // Active manager used for MCP-backed skills.
     manager: Option<Arc<McpManager>>,
 
@@ -154,7 +155,9 @@ impl AgentBootstrap {
         let environment = self.resolve_environment(workspace)?;
         let mut registry = self.build_builtin_registry(&environment.workspace);
 
-        let builtin_names = registry.tool_names();
+        let mut builtin_names = registry.tool_names();
+        // These built-ins are registered after MCP-backed skills have been loaded.
+        builtin_names.extend(["ToolSearch", "Skill", "Spawn", "EnterPlanMode", "ExitPlanMode"].map(str::to_string));
         let mcp = self.connect_mcp(&mut registry, &builtin_names).await;
 
         let skills = self.load_skills(&environment.workspace, mcp.manager.as_deref()).await;
@@ -166,13 +169,15 @@ impl AgentBootstrap {
 
         let has_mcp = mcp.has_mcp();
         let mcp_managers = mcp.managers;
-        let engine = self.into_engine(
+        let mut engine = self.into_engine(
             provider.clone(),
             registry,
             plan_active_flag,
             environment.workspace,
             prompt_usage,
         );
+
+        engine.set_mcp_catalog(mcp.catalog);
 
         Ok(BootstrapResult {
             engine,
@@ -186,6 +191,7 @@ impl AgentBootstrap {
         info!(
             target: "aion_agent",
             workspace = %self.workspace.display(),
+            isolated_session = self.config.isolated_session,
             "agent bootstrap: workspace cwd resolved",
         );
 
@@ -195,7 +201,11 @@ impl AgentBootstrap {
     fn resolve_environment(&self, workspace_path: PathBuf) -> Result<BootstrapEnvironment> {
         Ok(BootstrapEnvironment {
             resolved_shell: resolve_shell_config(&self.config.shell)?,
-            memory_dir: auto_memory_dir(&workspace_path),
+            memory_dir: if self.config.isolated_session {
+                None
+            } else {
+                auto_memory_dir(&workspace_path)
+            },
             workspace: workspace_path,
         })
     }
@@ -245,9 +255,10 @@ impl AgentBootstrap {
             }
         };
 
-        register_mcp_tools(registry, &manager, builtin_names, &server_configs);
+        let catalog = McpToolCatalog::new(registry, Arc::clone(&manager), builtin_names, server_configs);
 
         McpBootstrap {
+            catalog: Some(catalog),
             manager: Some(Arc::clone(&manager)),
             managers: vec![manager],
         }
@@ -271,11 +282,18 @@ impl AgentBootstrap {
     }
 
     async fn load_skills(&self, workspace: &Path, mcp_manager: Option<&McpManager>) -> Vec<SkillMetadata> {
+        if self.config.isolated_session {
+            return Vec::new();
+        }
         load_all_skills(workspace, &self.extra_skill_dirs, false, mcp_manager).await
     }
 
     fn configure_system_prompt(&mut self, environment: &BootstrapEnvironment, skills: &[SkillMetadata]) -> PromptUsage {
-        let mut prompt_cache = SystemPromptCache::new();
+        let mut prompt_cache = if self.config.isolated_session {
+            SystemPromptCache::isolated()
+        } else {
+            SystemPromptCache::new()
+        };
         let workspace = self.workspace.to_string_lossy();
         let system_prompt = build_system_prompt_with_shell_and_tool_policy(
             &mut prompt_cache,
@@ -327,16 +345,18 @@ impl AgentBootstrap {
         workspace: &Path,
         skills: Vec<SkillMetadata>,
     ) {
-        let skill_checker = SkillPermissionChecker::new(
-            self.config.tools.skills.deny.clone(),
-            self.config.tools.skills.allow.clone(),
-            self.config.tools.auto_approve,
-        );
-        registry.register(Box::new(SkillTool::new(
-            Arc::new(skills),
-            self.workspace.to_path_buf(),
-            skill_checker,
-        )));
+        if !self.config.isolated_session {
+            let skill_checker = SkillPermissionChecker::new(
+                self.config.tools.skills.deny.clone(),
+                self.config.tools.skills.allow.clone(),
+                self.config.tools.auto_approve,
+            );
+            registry.register(Box::new(SkillTool::new(
+                Arc::new(skills),
+                self.workspace.to_path_buf(),
+                skill_checker,
+            )));
+        }
 
         let spawner = AgentSpawner::new_with_env(
             Arc::clone(provider),
@@ -361,7 +381,9 @@ impl AgentBootstrap {
 
     fn register_tool_search(&self, registry: &mut ToolRegistry) {
         let tool_defs_snapshot = registry.to_tool_defs_filtered(|tool| self.tool_policy.allows(tool.name()));
-        registry.register(Box::new(ToolSearchTool::new(tool_defs_snapshot)));
+        registry.register(Box::new(
+            ToolSearchTool::new(tool_defs_snapshot).with_documentation(registry.documentation()),
+        ));
     }
 
     fn into_engine(

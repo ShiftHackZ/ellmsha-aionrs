@@ -131,6 +131,7 @@ fn extract_jsonrpc_from_sse_buffer(buffer: &str) -> Option<JsonRpcResponse> {
         let data = data_lines.join("\n");
         if !data.is_empty()
             && let Ok(rpc_response) = serde_json::from_str::<JsonRpcResponse>(&data)
+            && rpc_response.id.is_some()
         {
             return Some(rpc_response);
         }

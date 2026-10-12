@@ -34,18 +34,22 @@ use aion_config::compact::CompactConfig;
 use aion_config::compat::ProviderCompat;
 use aion_config::config::Config;
 use aion_config::hooks::HookEngine;
+use aion_mcp::tool_proxy::McpToolCatalog;
 use aion_protocol::ToolApprovalManager;
 use aion_protocol::events::ToolCategory;
 use aion_protocol::writer::ProtocolEmitter;
 use aion_providers::provider::{LlmProvider, create_provider};
 use aion_tools::registry::ToolRegistry;
+use aion_tools::tool_search::ToolSearchTool;
 use aion_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 use aion_types::message::{ContentBlock, ImageInputCapability, Message, Role, StopReason, TokenUsage};
 use aion_types::skill_types::{ContextModifier, PlanModeTransition, effort_to_string};
 use aion_types::tool::ToolDef;
 use anyhow::{Error as AnyhowError, Result as AnyhowResult};
 use chrono::Utc;
+use futures::future::join_all;
 use serde_json::to_string;
+use std::collections::HashSet;
 use tokio::sync::mpsc::Receiver;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
@@ -92,6 +96,7 @@ pub struct AgentEngine {
     // Tool execution policy.
     /// Registry of tools available to the engine.
     tools: ToolRegistry,
+    mcp_catalogs: Vec<McpToolCatalog>,
     /// Runtime authorization applied to tool advertisement and execution.
     tool_policy: ToolPolicy,
     /// Shared tool confirmer used for approval policy decisions.
@@ -201,6 +206,7 @@ impl AgentEngine {
                 .max_tool_call_failure_turns
                 .unwrap_or(DEFAULT_MAX_TOOL_CALL_FAILURE),
             tools,
+            mcp_catalogs: Vec::new(),
             tool_policy: ToolPolicy::default(),
             confirmer: Arc::new(Mutex::new(confirmer)),
             allow_list,
@@ -296,6 +302,7 @@ impl AgentEngine {
                 .max_tool_call_failure_turns
                 .unwrap_or(DEFAULT_MAX_TOOL_CALL_FAILURE),
             tools,
+            mcp_catalogs: Vec::new(),
             tool_policy: ToolPolicy::default(),
             confirmer: Arc::new(Mutex::new(confirmer)),
             allow_list,
@@ -342,6 +349,29 @@ impl AgentEngine {
 
     pub fn registry_mut(&mut self) -> &mut ToolRegistry {
         &mut self.tools
+    }
+
+    /// Retain MCP catalog ownership for bounded refresh between completed model rounds.
+    pub(crate) fn set_mcp_catalog(&mut self, catalog: Option<McpToolCatalog>) {
+        self.mcp_catalogs = catalog.into_iter().collect();
+    }
+
+    /// Add a host-connected MCP catalog before the next turn and refresh lazy discovery.
+    pub fn add_mcp_catalog(&mut self, catalog: McpToolCatalog) {
+        self.mcp_catalogs.push(catalog);
+        self.rebuild_tool_search();
+    }
+
+    fn rebuild_tool_search(&mut self) {
+        self.tools.remove_names(&HashSet::from(["ToolSearch".to_string()]));
+        let definitions = self
+            .tools
+            .to_tool_defs_filtered(|tool| self.tool_policy.allows(tool.name()));
+        let documentation = self.tools.documentation();
+        self.tools.register(Box::new(
+            ToolSearchTool::new(definitions).with_documentation(documentation),
+        ));
+        self.refresh_local_context_estimate();
     }
 
     /// Replace the runtime authorization policy for registered tools.
@@ -467,6 +497,8 @@ impl AgentEngine {
             self.max_tool_call_malformed_turns,
             self.max_tool_call_failure_turns,
         );
+        let mut empty_recovery_used = false;
+        let mut next_turn = TurnKind::Normal;
         loop {
             if let Some(limit) = guards.turn_budget_reached() {
                 self.save_session();
@@ -483,7 +515,8 @@ impl AgentEngine {
                 });
             }
 
-            let outcome = self.run_turn(TurnKind::Normal).await?;
+            let outcome = self.run_turn(next_turn).await?;
+            next_turn = TurnKind::Normal;
             guards.record_counted_turn();
 
             let tool_calls = match TurnOutcome::from_stream(outcome) {
@@ -524,16 +557,21 @@ impl AgentEngine {
                         assistant_text_bytes = outcome.assistant_text.len(),
                         thinking_text_bytes = outcome.thinking_text.len(),
                         tool_call_count = outcome.tool_calls.len(),
-                        "provider turn produced no valid final answer; retrying finalization"
+                        recovery_used = empty_recovery_used,
+                        counted_turns = guards.counted_turns(),
+                        "provider turn produced no visible answer or tool calls"
                     );
-                    return self
-                        .finalize_once(
-                            FinalizationReason::EmptyFinal,
-                            outcome.assistant_text,
-                            guards.counted_turns(),
-                            StopReason::EndTurn,
-                        )
-                        .await;
+                    if empty_recovery_used {
+                        self.save_session();
+                        return Err(AgentError::ApiError(
+                            "The provider returned no visible answer or tool calls after one recovery attempt; the task may be incomplete.".to_string(),
+                        ));
+                    }
+                    // One recovery per run, counted by the same budget and tool guards.
+                    // Completed calls stay in history; only new model calls can execute.
+                    empty_recovery_used = true;
+                    next_turn = TurnKind::EmptyFinalRecovery;
+                    continue;
                 }
             };
 
@@ -810,6 +848,16 @@ impl AgentEngine {
     }
 
     async fn run_turn(&mut self, kind: TurnKind) -> Result<StreamOutcome, AgentError> {
+        // Tool calls from the previous round have completed. TTL/notifications bound refresh overhead.
+        let changed = join_all(self.mcp_catalogs.iter().map(McpToolCatalog::refresh)).await;
+        if changed.iter().any(|changed| *changed) {
+            for (catalog, changed) in self.mcp_catalogs.iter_mut().zip(changed) {
+                if changed {
+                    catalog.apply(&mut self.tools);
+                }
+            }
+            self.rebuild_tool_search();
+        }
         let span = info_span!(
             target: "aion_agent",
             "llm_generation",
@@ -843,6 +891,17 @@ impl AgentEngine {
         fallback_stop_reason: StopReason,
     ) -> Result<AgentResult, AgentError> {
         let outcome = self.run_turn(TurnKind::Finalization(reason)).await?;
+        // Streaming already announced these calls; close them without executing disabled tools.
+        for call in &outcome.tool_calls {
+            if let ContentBlock::ToolUse { id, name, .. } = call {
+                self.output.emit_tool_result(
+                    id,
+                    name,
+                    true,
+                    "Tool call was not executed because tools are disabled during finalization.",
+                );
+            }
+        }
         let combined_text = format!("{}{}", prefix_text, outcome.assistant_text);
         let is_success = outcome.tool_calls.is_empty()
             && outcome.stop_reason == StopReason::EndTurn

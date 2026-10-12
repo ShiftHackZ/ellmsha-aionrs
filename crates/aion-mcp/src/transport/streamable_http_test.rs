@@ -40,3 +40,14 @@ mod tests {
         assert!(extract_jsonrpc_from_sse_buffer(body).is_none());
     }
 }
+
+#[test]
+fn notifications_do_not_replace_the_rpc_response() {
+    let stream = concat!(
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"tools\":[]}}\n\n"
+    );
+    let response = extract_jsonrpc_from_sse_buffer(stream).unwrap();
+    assert_eq!(response.id, Some(42));
+    assert_eq!(response.result.unwrap()["tools"], serde_json::json!([]));
+}

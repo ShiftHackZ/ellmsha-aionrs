@@ -55,7 +55,8 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        Config::resolve(&CliArgs {
+        // Owned defaults for tests; never import the developer's ambient config.
+        let mut config = Config::resolve_isolated(&CliArgs {
             provider: Some("anthropic".to_string()),
             api_key: Some("sk-test".to_string()),
             base_url: None,
@@ -71,7 +72,9 @@ mod tests {
             auto_approve: false,
             project_dir: None,
         })
-        .unwrap()
+        .unwrap();
+        config.isolated_session = false;
+        config
     }
 
     #[test]
@@ -129,5 +132,38 @@ mod tests {
         assert!(allowed.content.contains("AllowedDeferred"));
         assert!(denied.content.starts_with("No deferred tools matching"));
         assert!(!denied.content.contains("\"name\": \"DeniedDeferred\""));
+    }
+
+    #[tokio::test]
+    async fn isolated_bootstrap_omits_ambient_instructions_memory_and_all_skills() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "AMBIENT_PROJECT_MARKER").unwrap();
+        let skill_root = workspace.path().join(".aionrs/skills/ambient-skill");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: ambient-skill\ndescription: Ambient fixture\n---\nAMBIENT_SKILL_MARKER",
+        )
+        .unwrap();
+        let mut config = test_config();
+        config.isolated_session = true;
+        config.system_prompt = Some("EXPLICIT_SESSION_MARKER".into());
+        let mut bootstrap = AgentBootstrap::new(config, workspace.path().to_string_lossy(), Arc::new(NullSink))
+            .extra_skill_dirs(vec![skill_root]);
+        let environment = bootstrap.resolve_environment(workspace.path().into()).unwrap();
+        assert!(environment.memory_dir.is_none());
+        let skills = bootstrap.load_skills(workspace.path(), None).await;
+        assert!(skills.is_empty(), "even bundled and explicit extra skills are omitted");
+        bootstrap.configure_system_prompt(&environment, &skills);
+        let prompt = bootstrap.config.system_prompt.as_ref().unwrap();
+        assert!(prompt.contains("EXPLICIT_SESSION_MARKER"));
+        assert!(!prompt.contains("AMBIENT_PROJECT_MARKER"));
+        assert!(!prompt.contains("AMBIENT_SKILL_MARKER"));
+        assert!(!prompt.contains("auto memory"));
+        let provider = bootstrap.resolve_provider();
+        let mut registry = ToolRegistry::new();
+        bootstrap.register_agent_tools(&mut registry, &provider, workspace.path(), skills);
+        assert!(registry.get("Skill").is_none());
+        assert!(registry.get("Spawn").is_some());
     }
 }

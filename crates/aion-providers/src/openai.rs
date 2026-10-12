@@ -139,9 +139,11 @@ pub(crate) fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id:
 
     let delta = &choice["delta"];
 
-    // Reasoning content (OpenAI reasoning models)
-    if let Some(reasoning) = delta["reasoning_content"].as_str()
-        && !reasoning.is_empty()
+    // Accept either compatible wire field, preferring the canonical field per chunk.
+    if let Some(reasoning) = delta["reasoning_content"]
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .or_else(|| delta["reasoning"].as_str().filter(|text| !text.is_empty()))
     {
         events.push(LlmEvent::ThinkingDelta(reasoning.to_string()));
     }

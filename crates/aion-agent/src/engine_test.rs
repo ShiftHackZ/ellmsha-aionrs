@@ -45,6 +45,7 @@ mod tests_set_config {
 
     fn make_engine(model: &str) -> super::AgentEngine {
         super::AgentEngine {
+            mcp_catalogs: Vec::new(),
             provider: Arc::new(NullProvider),
             model: model.to_string(),
             max_tokens: Some(4096),
@@ -421,6 +422,7 @@ mod tests_phase6 {
 
     fn make_engine(model: &str, allow_list: Vec<String>) -> super::AgentEngine {
         super::AgentEngine {
+            mcp_catalogs: Vec::new(),
             provider: Arc::new(NullProvider),
             model: model.to_string(),
             max_tokens: Some(4096),
@@ -706,6 +708,7 @@ mod tests_compact {
         output: Arc<dyn OutputSink>,
     ) -> super::AgentEngine {
         super::AgentEngine {
+            mcp_catalogs: Vec::new(),
             provider: Arc::new(NullProvider),
             model: "test-model".to_string(),
             max_tokens: Some(4096),
@@ -1408,6 +1411,7 @@ mod tests_plan_mode {
     fn make_plan_engine(allow_list: Vec<String>) -> super::AgentEngine {
         let flag = Arc::new(AtomicBool::new(false));
         super::AgentEngine {
+            mcp_catalogs: Vec::new(),
             provider: Arc::new(NullProvider),
             model: "test-model".to_string(),
             max_tokens: Some(4096),
@@ -1628,6 +1632,7 @@ mod tests_handle_command {
 
     fn make_engine() -> AgentEngine {
         AgentEngine {
+            mcp_catalogs: Vec::new(),
             provider: Arc::new(NullProvider),
             model: "test-model".to_string(),
             max_tokens: Some(4096),
@@ -2483,13 +2488,15 @@ mod tests_loop_helpers {
     }
 
     #[test]
-    fn turn_kind_empty_final_prompt_requests_visible_answer() {
-        let kind = TurnKind::Finalization(FinalizationReason::EmptyFinal);
+    fn turn_kind_empty_final_recovery_preserves_tools() {
+        let kind = TurnKind::EmptyFinalRecovery;
         let prompt = kind.control_prompt().expect("empty final nudge must have a prompt");
 
-        assert_eq!(kind.diagnostic_phase(), "empty_final_retry");
+        assert!(!kind.disable_tools());
+        assert_eq!(kind.diagnostic_phase(), "empty_final_recovery");
         assert!(prompt.contains("visible answer text"));
         assert!(prompt.contains("Do not send reasoning only"));
+        assert!(prompt.contains("Continue the unfinished task"));
     }
 
     fn stream_outcome(assistant_text: &str, stop_reason: StopReason, tool_calls: Vec<ContentBlock>) -> StreamOutcome {
@@ -2653,6 +2660,7 @@ mod tests_tool_policy_enforcement {
         }));
 
         AgentEngine {
+            mcp_catalogs: Vec::new(),
             provider: Arc::new(NullProvider),
             compat: ProviderCompat::anthropic_defaults(),
             thinking: None,

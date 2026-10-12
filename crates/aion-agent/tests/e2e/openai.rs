@@ -18,6 +18,7 @@ fn openai_api_key() -> Option<String> {
 fn openai_config(api_key: &str) -> Config {
     Config {
         provider: ProviderType::OpenAI,
+        isolated_session: false,
         provider_label: "openai".to_string(),
         api_key: api_key.to_string(),
         base_url: "https://api.openai.com/v1".to_string(),

@@ -18,13 +18,13 @@ mod tests {
     // MockTransport: returns pre-configured JSON-RPC responses
     // -----------------------------------------------------------------------
 
-    struct MockTransport {
+    pub(super) struct MockTransport {
         /// Responses returned in order for each request call
         responses: Mutex<Vec<serde_json::Value>>,
     }
 
     impl MockTransport {
-        fn new(responses: Vec<serde_json::Value>) -> Self {
+        pub(super) fn new(responses: Vec<serde_json::Value>) -> Self {
             Self {
                 responses: Mutex::new(responses),
             }
@@ -95,7 +95,8 @@ mod tests {
         McpServer {
             name: name.to_string(),
             transport: Box::new(MockTransport::new(vec![])),
-            tools: vec![],
+            tools: RwLock::new(vec![]),
+            instructions: None,
             supports_resources: false,
         }
     }
@@ -384,4 +385,123 @@ mod tests {
         assert_eq!(id1, 10, "first ID should be 10");
         assert_eq!(id2, 11, "second ID should be 11");
     }
+}
+
+#[tokio::test]
+async fn initialized_guidance_and_paginated_catalog_are_preserved() {
+    use tests::MockTransport;
+    let server = McpManager::initialize_transport("fixture", Box::new(MockTransport::new(vec![
+        json!({"protocolVersion":"2025-03-26", "capabilities":{}, "instructions":"Inspect index status before searching."}),
+        json!({"tools":[{"name":"second", "inputSchema":{"type":"object"}}], "nextCursor":"page-2"}),
+        json!({"tools":[{"name":"first", "inputSchema":{"type":"object"}}]})
+    ]))).await.unwrap();
+    assert_eq!(
+        server.instructions.as_deref(),
+        Some("Inspect index status before searching.")
+    );
+    assert_eq!(
+        server
+            .tools
+            .read()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    let server = McpManager::initialize_transport(
+        "legacy",
+        Box::new(MockTransport::new(vec![
+            json!({"protocolVersion":"2025-03-26", "capabilities":{}}),
+            json!({"tools":[]}),
+        ])),
+    )
+    .await
+    .unwrap();
+    assert!(server.instructions.is_none());
+}
+
+#[tokio::test]
+async fn pagination_rejects_duplicate_names_repeated_cursors_and_page_limit() {
+    use tests::MockTransport;
+    let tool = json!({"name":"one", "inputSchema":{"type":"object"}});
+    for pages in [
+        vec![
+            json!({"tools":[tool.clone()], "nextCursor":"x"}),
+            json!({"tools":[tool]}),
+        ],
+        vec![
+            json!({"tools":[], "nextCursor":"x"}),
+            json!({"tools":[], "nextCursor":"x"}),
+        ],
+        (0..MAX_TOOL_PAGES)
+            .map(|n| json!({"tools":[], "nextCursor":format!("page-{n}")}))
+            .collect(),
+    ] {
+        assert!(
+            McpManager::list_tools(&MockTransport::new(pages), &AtomicU64::new(1))
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_replaces_schema_removes_tools_and_retains_complete_catalog_on_failure() {
+    use crate::tool_proxy::McpToolCatalog;
+    use aion_tools::Tool;
+    use aion_tools::registry::ToolRegistry;
+    use aion_tools::tool_search::ToolSearchTool;
+    use std::sync::Arc;
+    use tests::MockTransport;
+    let tool = |name: &str, property: &str| json!({"name":name,"inputSchema":{"type":"object","properties":{property:{"type":"string"}}}});
+    let server = McpManager::initialize_transport(
+        "fixture",
+        Box::new(MockTransport::new(vec![
+            json!({"protocolVersion":"2025-03-26","capabilities":{}, "instructions":"Use only this fixture."}),
+            json!({"tools":[tool("keep", "old"),tool("remove", "old")]}),
+            json!({"tools":[tool("keep", "new"),tool("add", "new")]}),
+            json!({"tools":[tool("partial", "bad")], "nextCursor":"broken"}),
+            json!({"unexpected":"invalid second page"}),
+            json!({"tools":[]}),
+        ])),
+    )
+    .await
+    .unwrap();
+    let manager = Arc::new(McpManager {
+        servers: HashMap::from([("fixture".into(), server)]),
+        next_id: AtomicU64::new(1000),
+        last_refresh: Mutex::new(Instant::now()),
+    });
+    let mut registry = ToolRegistry::new();
+    let mut catalog = McpToolCatalog::new(&mut registry, manager.clone(), &[], HashMap::new());
+    assert!(registry.get("remove").is_some());
+    let old_description = registry.get("keep").unwrap().description().to_string();
+    assert!(
+        !catalog.refresh().await,
+        "TTL avoids another discovery immediately after connection"
+    );
+    *manager.last_refresh.lock().unwrap() = Instant::now() - CATALOG_REFRESH_INTERVAL;
+    assert!(catalog.refresh().await);
+    catalog.apply(&mut registry);
+    assert!(registry.get("remove").is_none());
+    assert!(registry.get("add").is_some());
+    assert_ne!(registry.get("keep").unwrap().description(), old_description);
+    assert!(
+        registry.get("keep").unwrap().input_schema()["properties"]
+            .get("new")
+            .is_some()
+    );
+    let search = ToolSearchTool::new(registry.to_tool_defs()).with_documentation(registry.documentation());
+    let docs = search.execute(json!({"query":"fixture"})).await;
+    assert!(docs.content.contains("Use only this fixture."));
+    assert!(!docs.content.contains("\"old\""));
+    *manager.last_refresh.lock().unwrap() = Instant::now() - CATALOG_REFRESH_INTERVAL;
+    assert!(!catalog.refresh().await);
+    assert!(registry.get("partial").is_none());
+    assert!(registry.get("keep").is_some());
+    *manager.last_refresh.lock().unwrap() = Instant::now() - CATALOG_REFRESH_INTERVAL;
+    assert!(catalog.refresh().await);
+    catalog.apply(&mut registry);
+    assert!(registry.tool_names().is_empty());
 }

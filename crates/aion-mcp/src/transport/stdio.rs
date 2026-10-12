@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
@@ -12,9 +12,11 @@ use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
 /// Stdio transport: communicates with MCP server via child process stdin/stdout
 pub struct StdioTransport {
     stdin: Mutex<BufWriter<ChildStdin>>,
-    stdout: Mutex<BufReader<ChildStdout>>,
+    stdout: Mutex<Lines<BufReader<ChildStdout>>>,
     child: Mutex<Child>,
     next_id: AtomicU64,
+    request_lock: Mutex<()>,
+    tools_changed: AtomicBool,
 }
 
 impl StdioTransport {
@@ -43,9 +45,11 @@ impl StdioTransport {
 
         Ok(Self {
             stdin: Mutex::new(BufWriter::new(stdin)),
-            stdout: Mutex::new(BufReader::new(stdout)),
+            stdout: Mutex::new(BufReader::new(stdout).lines()),
             child: Mutex::new(child),
             next_id: AtomicU64::new(1),
+            request_lock: Mutex::new(()),
+            tools_changed: AtomicBool::new(false),
         })
     }
 
@@ -76,27 +80,30 @@ impl StdioTransport {
     }
 
     /// Read a single JSON-RPC response from stdout
-    async fn read_response(&self) -> Result<JsonRpcResponse, McpError> {
+    async fn read_response(&self, expected_id: u64) -> Result<JsonRpcResponse, McpError> {
         let mut stdout = self.stdout.lock().await;
-        let mut line = String::new();
-
-        // Read lines until we get a non-empty one (skip blank lines)
         loop {
-            line.clear();
-            let bytes_read = stdout
-                .read_line(&mut line)
+            // Lines::next_line is cancellation-safe when a bounded catalog refresh times out.
+            let line = stdout
+                .next_line()
                 .await
-                .map_err(|e| McpError::Transport(format!("Read from stdout failed: {}", e)))?;
-
-            if bytes_read == 0 {
-                return Err(McpError::Transport("Child process stdout closed".into()));
+                .map_err(|error| McpError::Transport(format!("Read from stdout failed: {error}")))?
+                .ok_or_else(|| McpError::Transport("Child process stdout closed".into()))?;
+            if line.trim().is_empty() {
+                continue;
             }
-
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                let response: JsonRpcResponse = serde_json::from_str(trimmed).map_err(|e| {
-                    McpError::Transport(format!("Failed to parse JSON-RPC response: {} — raw: {}", e, trimmed))
-                })?;
+            let value: serde_json::Value = serde_json::from_str(&line)
+                .map_err(|error| McpError::Transport(format!("Invalid JSON-RPC response: {error}")))?;
+            if value.get("method").is_some() {
+                if value["method"] == "notifications/tools/list_changed" {
+                    self.tools_changed.store(true, Ordering::Release);
+                }
+                continue;
+            }
+            let response: JsonRpcResponse = serde_json::from_value(value)
+                .map_err(|error| McpError::Transport(format!("Invalid JSON-RPC response: {error}")))?;
+            // Discard late responses to timed-out requests, never treat them as the next call's result.
+            if response.id == Some(expected_id) {
                 return Ok(response);
             }
         }
@@ -106,8 +113,12 @@ impl StdioTransport {
 #[async_trait]
 impl McpTransport for StdioTransport {
     async fn request(&self, req: &JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
-        self.send(req).await?;
-        let response = self.read_response().await?;
+        let _request = self.request_lock.lock().await;
+        let request = JsonRpcRequest::new(self.next_id(), &req.method, req.params.clone());
+        self.send(&request).await?;
+        let response = self
+            .read_response(request.id.expect("request always has an ID"))
+            .await?;
 
         // Check for JSON-RPC error in response
         if let Some(err) = &response.error {
@@ -124,6 +135,10 @@ impl McpTransport for StdioTransport {
         self.send(req).await
     }
 
+    fn take_tools_changed(&self) -> bool {
+        self.tools_changed.swap(false, Ordering::AcqRel)
+    }
+
     async fn close(&self) -> Result<(), McpError> {
         // Drop stdin to signal EOF, then wait for child
         let mut child = self.child.lock().await;
@@ -132,3 +147,7 @@ impl McpTransport for StdioTransport {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "stdio_test.rs"]
+mod stdio_test;

@@ -10,4 +10,4 @@ pub mod tool_search;
 pub mod view_image;
 pub mod write;
 
-pub use tool::{Tool, ToolExecutionOutput, truncate_utf8};
+pub use tool::{Tool, ToolDocumentation, ToolExecutionOutput, truncate_utf8};
