@@ -264,13 +264,19 @@ pub async fn execute_tool_calls_with_approval(
         let tool = registry.get(name);
         let category = tool.map(|t| t.category()).unwrap_or(ToolCategory::Exec);
         let description = tool.map(|t| t.describe(input)).unwrap_or_default();
+        let mcp_identity = tool.and_then(|tool| tool.mcp_approval_identity());
 
         // Check if approval is needed
         let needs_approval = !auto_approve
             && !allow_list.contains(&name.to_string())
-            && !approval_manager.is_auto_approved(&category.to_string());
+            && !approval_manager.is_auto_approved(&category.to_string())
+            && !mcp_identity
+                .as_ref()
+                .is_some_and(|identity| approval_manager.is_mcp_approved(identity));
 
         if needs_approval {
+            // Register before emitting; a synchronous host may answer immediately.
+            let rx = approval_manager.request_tool_approval(id, &category, mcp_identity);
             // Emit tool_request and wait for approval
             let _ = writer.emit(&ProtocolEvent::ToolRequest {
                 msg_id: msg_id.to_string(),
@@ -283,7 +289,6 @@ pub async fn execute_tool_calls_with_approval(
                 },
             });
 
-            let rx = approval_manager.request_approval(id, &category);
             match rx.await {
                 Ok(ToolApprovalResult::Approved) => { /* continue to execute */ }
                 Ok(ToolApprovalResult::Denied { reason }) => {

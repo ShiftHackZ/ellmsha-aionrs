@@ -108,6 +108,13 @@ impl Tool for McpToolProxy {
         ToolCategory::Mcp
     }
 
+    fn mcp_approval_identity(&self) -> Option<aion_protocol::McpApprovalIdentity> {
+        Some(aion_protocol::McpApprovalIdentity {
+            server: self.server_name.clone(),
+            tool: self.tool_name.clone(),
+        })
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!(
             "MCP {}/{}: {}",

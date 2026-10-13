@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use tokio::sync::oneshot;
@@ -16,6 +17,21 @@ pub enum ToolApprovalResult {
 struct PendingApproval {
     tx: oneshot::Sender<ToolApprovalResult>,
     category: String,
+    mcp: Option<McpApprovalIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct McpApprovalIdentity {
+    pub server: String,
+    pub tool: String,
+}
+
+/// Host-owned persistence for exact MCP identities. Implementations must bind
+/// server identity to the authenticated user and selected connection/config.
+pub trait McpApprovalPersistence: Send + Sync {
+    fn supports(&self, identity: &McpApprovalIdentity) -> bool;
+    fn allows(&self, identity: &McpApprovalIdentity) -> Result<bool, String>;
+    fn grant(&self, identity: &McpApprovalIdentity) -> Result<(), String>;
 }
 
 /// Manages pending tool approval requests using oneshot channels.
@@ -30,6 +46,8 @@ pub struct ToolApprovalManager {
     pending: Mutex<HashMap<String, PendingApproval>>,
     auto_approved: Mutex<HashSet<String>>,
     session_mode: Mutex<SessionMode>,
+    session_mcp: Mutex<HashSet<McpApprovalIdentity>>,
+    persistence: Option<Arc<dyn McpApprovalPersistence>>,
 }
 
 impl ToolApprovalManager {
@@ -38,10 +56,57 @@ impl ToolApprovalManager {
             pending: Mutex::new(HashMap::new()),
             auto_approved: Mutex::new(HashSet::new()),
             session_mode: Mutex::new(SessionMode::Default),
+            session_mcp: Mutex::new(HashSet::new()),
+            persistence: None,
+        }
+    }
+
+    pub fn with_persistence(mut self, persistence: Arc<dyn McpApprovalPersistence>) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    pub fn supports_persistence(&self, identity: &McpApprovalIdentity) -> bool {
+        self.persistence.as_ref().is_some_and(|store| store.supports(identity))
+    }
+
+    pub fn pending_supports_persistence(&self, call_id: &str) -> bool {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(call_id).and_then(|request| request.mcp.clone()))
+            .is_some_and(|identity| self.supports_persistence(&identity))
+    }
+
+    pub fn is_mcp_approved(&self, identity: &McpApprovalIdentity) -> bool {
+        if self
+            .session_mcp
+            .lock()
+            .map(|grants| grants.contains(identity))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        match self.persistence.as_ref().map(|store| store.allows(identity)) {
+            Some(Ok(allowed)) => allowed,
+            Some(Err(_)) => {
+                tracing::warn!("MCP approval store unavailable; requiring approval");
+                false
+            }
+            None => false,
         }
     }
 
     pub fn request_approval(&self, call_id: &str, category: &ToolCategory) -> oneshot::Receiver<ToolApprovalResult> {
+        self.request_tool_approval(call_id, category, None)
+    }
+
+    pub fn request_tool_approval(
+        &self,
+        call_id: &str,
+        category: &ToolCategory,
+        mcp: Option<McpApprovalIdentity>,
+    ) -> oneshot::Receiver<ToolApprovalResult> {
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(
@@ -49,6 +114,7 @@ impl ToolApprovalManager {
                 PendingApproval {
                     tx,
                     category: category.to_string(),
+                    mcp,
                 },
             );
         }
@@ -56,14 +122,41 @@ impl ToolApprovalManager {
     }
 
     pub fn approve(&self, call_id: &str, scope: ApprovalScope) {
-        let pending = self.pending.lock().ok().and_then(|mut pending| pending.remove(call_id));
+        if let Err(error) = self.approve_checked(call_id, scope) {
+            tracing::warn!(%error, "Approval could not be saved; request remains pending");
+        }
+    }
+
+    pub fn approve_checked(&self, call_id: &str, scope: ApprovalScope) -> Result<(), String> {
+        // Save before resolving the pending call. A failed durable write must not
+        // silently run the tool or masquerade as a persisted authorization.
+        let mut pending = self.pending.lock().map_err(|_| "Approval lock unavailable")?;
+        if let Some(request) = pending.get(call_id) {
+            if let Some(identity) = &request.mcp {
+                match scope {
+                    ApprovalScope::Always => self
+                        .persistence
+                        .as_ref()
+                        .ok_or("Durable MCP approval is unavailable")?
+                        .grant(identity)?,
+                    ApprovalScope::Session => {
+                        self.session_mcp
+                            .lock()
+                            .map_err(|_| "Approval lock unavailable")?
+                            .insert(identity.clone());
+                    }
+                    ApprovalScope::Once => {}
+                }
+            } else if request.category != "mcp" && matches!(scope, ApprovalScope::Always | ApprovalScope::Session) {
+                self.add_auto_approve(&request.category);
+            }
+        }
+        let pending = pending.remove(call_id);
 
         if let Some(pending) = pending {
-            if matches!(scope, ApprovalScope::Always) {
-                self.add_auto_approve(&pending.category);
-            }
             let _ = pending.tx.send(ToolApprovalResult::Approved);
         }
+        Ok(())
     }
 
     pub fn resolve(&self, call_id: &str, result: ToolApprovalResult) {
@@ -122,6 +215,10 @@ impl ToolApprovalManager {
     }
 
     pub fn add_auto_approve(&self, category: &str) {
+        // MCP permissions are always keyed by server and tool, never category.
+        if category == "mcp" {
+            return;
+        }
         if let Ok(mut auto) = self.auto_approved.lock() {
             auto.insert(category.to_string());
         }

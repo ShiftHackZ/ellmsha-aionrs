@@ -67,6 +67,7 @@ pub enum ProtocolCommand {
 pub enum ApprovalScope {
     #[default]
     Once,
+    Session,
     Always,
 }
 
