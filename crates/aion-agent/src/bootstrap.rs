@@ -71,6 +71,7 @@ pub struct AgentBootstrap {
     // Optional externally supplied runtime state.
     provider: Option<Arc<dyn LlmProvider>>,
     child_router: Option<Arc<dyn ChildRouter>>,
+    host_delegation: bool,
     host_approval: Option<(Arc<ToolApprovalManager>, Arc<dyn ProtocolEmitter>)>,
     resume_session: Option<Session>,
     runtime_env: Vec<(String, String)>,
@@ -111,6 +112,7 @@ impl AgentBootstrap {
             output,
             provider: None,
             child_router: None,
+            host_delegation: false,
             host_approval: None,
             resume_session: None,
             runtime_env: Vec::new(),
@@ -127,6 +129,13 @@ impl AgentBootstrap {
     /// Route host-managed child assignments while retaining their inherited tools.
     pub fn child_router(mut self, router: Arc<dyn ChildRouter>) -> Self {
         self.child_router = Some(router);
+        self
+    }
+
+    /// Host MCP owns V2 child routing. Keep the root model pinned, and do not
+    /// expose native Spawn which cannot create a child in another CLI runtime.
+    pub fn host_delegation(mut self, enabled: bool) -> Self {
+        self.host_delegation = enabled;
         self
     }
 
@@ -385,6 +394,9 @@ impl AgentBootstrap {
             )));
         }
 
+        if self.host_delegation {
+            return;
+        }
         let spawner = AgentSpawner::new_with_env(
             Arc::clone(provider),
             self.config.clone(),
@@ -437,7 +449,7 @@ impl AgentBootstrap {
         prompt_usage: PromptUsage,
     ) -> AgentEngine {
         let runtime_env = self.runtime_env.clone();
-        let pin_model = self.child_router.is_some();
+        let pin_model = self.child_router.is_some() || self.host_delegation;
         let mut engine = if let Some(session) = self.resume_session {
             AgentEngine::resume_with_provider_and_env(
                 provider,

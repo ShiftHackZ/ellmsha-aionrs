@@ -78,6 +78,18 @@ mod tests {
     }
 
     #[test]
+    fn host_delegation_suppresses_only_spawn_and_keeps_other_tools() {
+        for host in [false, true] {
+            let mut bootstrap = AgentBootstrap::new(test_config(), "/tmp", Arc::new(NullSink)).host_delegation(host);
+            let provider = bootstrap.resolve_provider();
+            let mut registry = bootstrap.build_builtin_registry(Path::new("/tmp"));
+            bootstrap.register_agent_tools(&mut registry, &provider, Path::new("/tmp"), vec![], None);
+            assert_eq!(registry.tool_names().iter().any(|n| n == "Spawn"), !host);
+            assert!(registry.tool_names().iter().any(|n| n == "Read"));
+        }
+    }
+
+    #[test]
     fn mcp_servers_with_runtime_env_uses_server_env_as_override() {
         let mut config = test_config();
         config.mcp.servers.insert(
