@@ -8,6 +8,7 @@ use aion_config::shell::{ResolvedShell, resolve_shell_config};
 use aion_mcp::manager::McpManager;
 use aion_mcp::tool_proxy::McpToolCatalog;
 use aion_memory::paths::{ENTRYPOINT_NAME, auto_memory_dir};
+use aion_protocol::{ToolApprovalManager, writer::ProtocolEmitter};
 use aion_providers::{LlmProvider, create_provider};
 use aion_skills::loader::load_all_skills;
 use aion_skills::permissions::SkillPermissionChecker;
@@ -33,7 +34,7 @@ use crate::plan::tools::{EnterPlanModeTool, ExitPlanModeTool};
 use crate::session::Session;
 use crate::skill_tool::SkillTool;
 use crate::spawn_tool::SpawnTool;
-use crate::spawner::AgentSpawner;
+use crate::spawner::{AgentSpawner, ChildRouter};
 use crate::tool_policy::ToolPolicy;
 
 /// Result of bootstrapping an agent engine with all features initialized.
@@ -69,6 +70,8 @@ pub struct AgentBootstrap {
 
     // Optional externally supplied runtime state.
     provider: Option<Arc<dyn LlmProvider>>,
+    child_router: Option<Arc<dyn ChildRouter>>,
+    host_approval: Option<(Arc<ToolApprovalManager>, Arc<dyn ProtocolEmitter>)>,
     resume_session: Option<Session>,
     runtime_env: Vec<(String, String)>,
     tool_policy: ToolPolicy,
@@ -107,6 +110,8 @@ impl AgentBootstrap {
             extra_skill_dirs: Vec::new(),
             output,
             provider: None,
+            child_router: None,
+            host_approval: None,
             resume_session: None,
             runtime_env: Vec::new(),
             tool_policy: ToolPolicy::default(),
@@ -116,6 +121,17 @@ impl AgentBootstrap {
     /// Use a pre-created provider instead of creating one from config.
     pub fn provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
         self.provider = Some(provider);
+        self
+    }
+
+    /// Route host-managed child assignments while retaining their inherited tools.
+    pub fn child_router(mut self, router: Arc<dyn ChildRouter>) -> Self {
+        self.child_router = Some(router);
+        self
+    }
+
+    pub fn host_approval(mut self, manager: Arc<ToolApprovalManager>, writer: Arc<dyn ProtocolEmitter>) -> Self {
+        self.host_approval = Some((manager, writer));
         self
     }
 
@@ -163,8 +179,18 @@ impl AgentBootstrap {
         let skills = self.load_skills(&environment.workspace, mcp.manager.as_deref()).await;
         let prompt_usage = self.configure_system_prompt(&environment, &skills);
 
-        self.register_agent_tools(&mut registry, &provider, &environment.workspace, skills);
-        let plan_active_flag = self.register_plan_tools(&mut registry);
+        let routed_plan_flag = self
+            .child_router
+            .as_ref()
+            .map(|_| self.register_plan_tools(&mut registry));
+        self.register_agent_tools(
+            &mut registry,
+            &provider,
+            &environment.workspace,
+            skills,
+            routed_plan_flag.clone(),
+        );
+        let plan_active_flag = routed_plan_flag.unwrap_or_else(|| self.register_plan_tools(&mut registry));
         self.register_tool_search(&mut registry);
 
         let has_mcp = mcp.has_mcp();
@@ -344,6 +370,7 @@ impl AgentBootstrap {
         provider: &Arc<dyn LlmProvider>,
         workspace: &Path,
         skills: Vec<SkillMetadata>,
+        plan_active_flag: Option<Arc<AtomicBool>>,
     ) {
         if !self.config.isolated_session {
             let skill_checker = SkillPermissionChecker::new(
@@ -365,6 +392,21 @@ impl AgentBootstrap {
             self.runtime_env.clone(),
             self.tool_policy.clone(),
         );
+        let spawner = if let Some(flag) = plan_active_flag {
+            spawner.with_parent_plan(flag)
+        } else {
+            spawner
+        };
+        let spawner = if let Some((manager, writer)) = &self.host_approval {
+            spawner.with_host_approval(manager.clone(), writer.clone())
+        } else {
+            spawner
+        };
+        let spawner = if let Some(router) = &self.child_router {
+            spawner.with_child_router(router.clone())
+        } else {
+            spawner
+        };
         registry.register(Box::new(SpawnTool::new(Arc::new(spawner))));
     }
 
@@ -395,6 +437,7 @@ impl AgentBootstrap {
         prompt_usage: PromptUsage,
     ) -> AgentEngine {
         let runtime_env = self.runtime_env.clone();
+        let pin_model = self.child_router.is_some();
         let mut engine = if let Some(session) = self.resume_session {
             AgentEngine::resume_with_provider_and_env(
                 provider,
@@ -408,6 +451,13 @@ impl AgentBootstrap {
         } else {
             AgentEngine::new_with_provider_and_env(provider, self.config, registry, self.output, workspace, runtime_env)
         };
+        if pin_model {
+            engine.pin_model();
+        }
+        if let Some((manager, writer)) = self.host_approval {
+            engine.set_approval_manager(manager);
+            engine.set_protocol_writer(writer);
+        }
         engine.set_plan_active_flag(plan_active_flag);
         engine.set_tool_policy(self.tool_policy);
         engine.set_prompt_usage(prompt_usage);

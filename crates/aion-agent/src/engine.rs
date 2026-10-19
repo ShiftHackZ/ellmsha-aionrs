@@ -117,6 +117,8 @@ pub struct AgentEngine {
     output: Arc<dyn OutputSink>,
     /// Optional host approval manager for JSON stream tool approvals.
     approval_manager: Option<Arc<ToolApprovalManager>>,
+    approval_namespace: Option<String>,
+    host_model_pinned: bool,
     /// Optional protocol emitter used to send structured host events.
     protocol_writer: Option<Arc<dyn ProtocolEmitter>>,
 
@@ -215,6 +217,8 @@ impl AgentEngine {
             current_session: None,
             output,
             approval_manager: None,
+            approval_namespace: None,
+            host_model_pinned: false,
             protocol_writer: None,
             compact_config,
             compact_state: CompactState::new(),
@@ -311,6 +315,8 @@ impl AgentEngine {
             current_session: Some(session),
             output,
             approval_manager: None,
+            approval_namespace: None,
+            host_model_pinned: false,
             protocol_writer: None,
             compact_config,
             compact_state,
@@ -410,6 +416,25 @@ impl AgentEngine {
     /// Get a reference to the output sink
     pub fn output(&self) -> &dyn OutputSink {
         self.output.as_ref()
+    }
+
+    /// Host routing pins provider/model for the whole conversation and tool loop.
+    pub fn pin_model(&mut self) {
+        self.host_model_pinned = true;
+    }
+
+    /// Approval IDs must not collide with the parent or another child provider.
+    pub fn set_approval_namespace(&mut self, namespace: String) {
+        self.approval_namespace = Some(namespace);
+    }
+
+    fn is_plan_active(&self) -> bool {
+        self.plan_state.is_active
+            || (self.host_model_pinned
+                && self
+                    .plan_active_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire)))
     }
 
     pub fn set_approval_manager(&mut self, mgr: Arc<ToolApprovalManager>) {
@@ -627,7 +652,7 @@ impl AgentEngine {
         let tools = self.tool_definitions_for_turn(kind);
 
         // Build system prompt: append plan mode instructions when active
-        let system = if self.plan_state.is_active {
+        let system = if self.is_plan_active() {
             format!("{}\n\n{}", self.system_prompt, plan_mode_instructions())
         } else {
             self.system_prompt.clone()
@@ -662,7 +687,7 @@ impl AgentEngine {
         let image_input = self.compat.image_input();
         if kind.disable_tools() {
             Vec::new()
-        } else if self.plan_state.is_active {
+        } else if self.is_plan_active() {
             self.tools.to_tool_defs_filtered(|tool| {
                 self.tool_policy.allows(tool.name())
                     && (!tool.requires_image_input() || image_input.supports_images())
@@ -711,7 +736,13 @@ impl AgentEngine {
                     .tools
                     .get(name)
                     .is_some_and(|tool| tool.requires_image_input() && !self.compat.image_input().supports_images());
-                (!self.tool_policy.allows(name) || capability_denied).then(|| name.clone())
+                let plan_denied = self.host_model_pinned
+                    && self.is_plan_active()
+                    && self
+                        .tools
+                        .get(name)
+                        .is_none_or(|tool| tool.category() != ToolCategory::Info);
+                (!self.tool_policy.allows(name) || capability_denied || plan_denied).then(|| name.clone())
             })
             .collect();
         let executable_tool_calls: Vec<_> = tool_calls
@@ -737,6 +768,7 @@ impl AgentEngine {
                 approval_mgr,
                 writer,
                 &self.msg_id,
+                self.approval_namespace.as_deref(),
                 auto_approve,
                 &self.allow_list,
                 self.hooks.as_mut(),
@@ -1114,7 +1146,7 @@ impl AgentEngine {
     }
 
     fn dynamic_system_tokens(&self) -> u64 {
-        if self.plan_state.is_active {
+        if self.is_plan_active() {
             estimate_text_tokens(plan_mode_instructions())
         } else {
             0
@@ -1469,7 +1501,12 @@ impl AgentEngine {
         let mut request_shape_changed = false;
         for modifier in modifiers.iter().flatten() {
             if let Some(ref model) = modifier.model {
-                self.model = model.clone();
+                if self.host_model_pinned {
+                    self.output
+                        .emit_info("Auto Router kept the pinned model; skill model override ignored");
+                } else {
+                    self.model = model.clone();
+                }
             }
             if let Some(effort) = modifier.effort {
                 self.reasoning_effort = Some(effort_to_string(effort));

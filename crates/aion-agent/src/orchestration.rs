@@ -246,6 +246,7 @@ pub async fn execute_tool_calls_with_approval(
     approval_manager: &Arc<ToolApprovalManager>,
     writer: &Arc<dyn ProtocolEmitter>,
     msg_id: &str,
+    approval_namespace: Option<&str>,
     auto_approve: bool,
     allow_list: &[String],
     mut hooks: Option<&mut HookEngine>,
@@ -261,6 +262,9 @@ pub async fn execute_tool_calls_with_approval(
             continue;
         };
 
+        let approval_id = approval_namespace
+            .map(|namespace| format!("{namespace}:{id}"))
+            .unwrap_or_else(|| id.clone());
         let tool = registry.get(name);
         let category = tool.map(|t| t.category()).unwrap_or(ToolCategory::Exec);
         let description = tool.map(|t| t.describe(input)).unwrap_or_default();
@@ -276,11 +280,11 @@ pub async fn execute_tool_calls_with_approval(
 
         if needs_approval {
             // Register before emitting; a synchronous host may answer immediately.
-            let rx = approval_manager.request_tool_approval(id, &category, mcp_identity);
+            let rx = approval_manager.request_tool_approval(&approval_id, &category, mcp_identity);
             // Emit tool_request and wait for approval
             let _ = writer.emit(&ProtocolEvent::ToolRequest {
                 msg_id: msg_id.to_string(),
-                call_id: id.clone(),
+                call_id: approval_id.clone(),
                 tool: ToolInfo {
                     name: name.clone(),
                     category,
@@ -294,7 +298,7 @@ pub async fn execute_tool_calls_with_approval(
                 Ok(ToolApprovalResult::Denied { reason }) => {
                     let _ = writer.emit(&ProtocolEvent::ToolCancelled {
                         msg_id: msg_id.to_string(),
-                        call_id: id.clone(),
+                        call_id: approval_id.clone(),
                         reason: reason.clone(),
                     });
                     results.push(ContentBlock::ToolResult {
@@ -315,7 +319,7 @@ pub async fn execute_tool_calls_with_approval(
         // Emit tool_running
         let _ = writer.emit(&ProtocolEvent::ToolRunning {
             msg_id: msg_id.to_string(),
-            call_id: id.clone(),
+            call_id: approval_id.clone(),
             tool_name: name.clone(),
         });
 
@@ -338,7 +342,7 @@ pub async fn execute_tool_calls_with_approval(
             };
             let _ = writer.emit(&ProtocolEvent::ToolResult {
                 msg_id: msg_id.to_string(),
-                call_id: id.clone(),
+                call_id: approval_id.clone(),
                 tool_name: name.clone(),
                 status,
                 output: content.clone(),

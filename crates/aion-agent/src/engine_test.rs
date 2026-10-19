@@ -68,6 +68,8 @@ mod tests_set_config {
             current_session: None,
             output: Arc::new(NullOutput),
             approval_manager: None,
+            approval_namespace: None,
+            host_model_pinned: false,
             protocol_writer: None,
             compact_config: aion_config::compact::CompactConfig::default(),
             compact_state: super::CompactState::new(),
@@ -445,6 +447,8 @@ mod tests_phase6 {
             current_session: None,
             output: Arc::new(NullOutput),
             approval_manager: None,
+            approval_namespace: None,
+            host_model_pinned: false,
             protocol_writer: None,
             compact_config: aion_config::compact::CompactConfig::default(),
             compact_state: super::CompactState::new(),
@@ -468,6 +472,19 @@ mod tests_phase6 {
         })];
         engine.apply_context_modifiers(&modifiers);
         assert_eq!(engine.model, "override-model");
+    }
+
+    #[test]
+    fn routed_model_stays_pinned_when_skill_requests_another_model() {
+        let mut engine = make_engine("selected-model", vec![]);
+        engine.pin_model();
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            model: Some("other-model".into()),
+            effort: Some(EffortLevel::High),
+            ..Default::default()
+        })]);
+        assert_eq!(engine.model, "selected-model");
+        assert_eq!(engine.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -731,6 +748,8 @@ mod tests_compact {
             current_session: None,
             output,
             approval_manager: None,
+            approval_namespace: None,
+            host_model_pinned: false,
             protocol_writer: None,
             compact_config,
             compact_state,
@@ -1434,6 +1453,8 @@ mod tests_plan_mode {
             current_session: None,
             output: Arc::new(NullOutput),
             approval_manager: None,
+            approval_namespace: None,
+            host_model_pinned: false,
             protocol_writer: None,
             compact_config: aion_config::compact::CompactConfig::default(),
             compact_state: CompactState::new(),
@@ -1655,6 +1676,8 @@ mod tests_handle_command {
             current_session: None,
             output: Arc::new(NullOutput),
             approval_manager: None,
+            approval_namespace: None,
+            host_model_pinned: false,
             protocol_writer: None,
             compact_config: CompactConfig::default(),
             compact_state: CompactState::new(),
@@ -2683,6 +2706,8 @@ mod tests_tool_policy_enforcement {
             current_session: None,
             output: Arc::new(NullOutput),
             approval_manager: None,
+            approval_namespace: None,
+            host_model_pinned: false,
             protocol_writer: None,
             compact_config: Default::default(),
             compact_state: CompactState::new(),

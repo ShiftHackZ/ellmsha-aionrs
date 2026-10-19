@@ -162,7 +162,7 @@ mod tests {
         assert!(!prompt.contains("auto memory"));
         let provider = bootstrap.resolve_provider();
         let mut registry = ToolRegistry::new();
-        bootstrap.register_agent_tools(&mut registry, &provider, workspace.path(), skills);
+        bootstrap.register_agent_tools(&mut registry, &provider, workspace.path(), skills, None);
         assert!(registry.get("Skill").is_none());
         assert!(registry.get("Spawn").is_some());
     }
