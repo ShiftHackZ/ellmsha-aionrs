@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use aion_types::tool::ToolDef;
 
@@ -6,6 +7,7 @@ use crate::{Tool, ToolDocumentation};
 
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    loaded: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Default for ToolRegistry {
@@ -15,7 +17,10 @@ impl Default for ToolRegistry {
 }
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            loaded: Default::default(),
+        }
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
@@ -25,6 +30,10 @@ impl ToolRegistry {
     /// Remove only the names owned by a refreshed catalog. Call between model turns.
     pub fn remove_names(&mut self, names: &HashSet<String>) {
         self.tools.retain(|tool| !names.contains(tool.name()));
+        self.loaded
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|name| !names.contains(name));
     }
 
     pub fn documentation(&self) -> HashMap<String, ToolDocumentation> {
@@ -32,6 +41,11 @@ impl ToolRegistry {
             .iter()
             .filter_map(|tool| tool.documentation().map(|doc| (tool.name().to_string(), doc)))
             .collect()
+    }
+
+    /// Session-local schemas selected by discovery; never shared between agents.
+    pub fn loaded_tools(&self) -> Arc<RwLock<HashSet<String>>> {
+        self.loaded.clone()
     }
 
     /// Find a tool by name
@@ -52,7 +66,7 @@ impl ToolRegistry {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 input_schema: t.input_schema(),
-                deferred: t.is_deferred(),
+                deferred: t.is_deferred() && !self.loaded.read().unwrap_or_else(|e| e.into_inner()).contains(t.name()),
             })
             .collect()
     }
@@ -71,7 +85,7 @@ impl ToolRegistry {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 input_schema: t.input_schema(),
-                deferred: t.is_deferred(),
+                deferred: t.is_deferred() && !self.loaded.read().unwrap_or_else(|e| e.into_inner()).contains(t.name()),
             })
             .collect()
     }

@@ -5,15 +5,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::cache_diagnostics::{CacheBreakDetector, CacheDiagnostic, CacheStats};
 use crate::commands::{CommandContext, CommandRegistry, CommandResult, SlashCommand, default_registry};
-use crate::compact::auto::{CompactError, autocompact, should_autocompact};
+use crate::compact::auto::{CompactError, autocompact_with_output as autocompact, should_autocompact};
 use crate::compact::emergency::is_at_emergency_limit;
 use crate::compact::estimate::{estimate_tokens_from_tool_image, estimate_tokens_from_tool_result};
 use crate::compact::micro::{microcompact, should_microcompact};
 use crate::compact::state::CompactState;
 use crate::confirm::ToolConfirmer;
 use crate::context_usage::{
-    ContextState, ContextStatus, PromptUsage, estimate_content_tokens, estimate_messages_tokens, estimate_text_tokens,
-    estimate_tool_definitions_tokens,
+    ContextSnapshot, ContextState, ContextStatus, PromptUsage, estimate_content_tokens, estimate_messages_tokens,
+    estimate_text_tokens, estimate_tool_definitions_tokens,
 };
 use crate::error::AgentError;
 use crate::orchestration::{ExecutionControl, execute_tool_calls, execute_tool_calls_with_approval};
@@ -131,6 +131,7 @@ pub struct AgentEngine {
     context_state: ContextState,
     /// Estimated category metadata for the system prompt.
     prompt_usage: PromptUsage,
+    request_metrics: std::collections::BTreeMap<String, u64>,
     /// Active compaction strategy level.
     compact_level: CompactLevel,
     /// Whether TOON-formatted compaction output is enabled.
@@ -224,6 +225,7 @@ impl AgentEngine {
             compact_state: CompactState::new(),
             context_state: ContextState::default(),
             prompt_usage,
+            request_metrics: Default::default(),
             compact_level: config.compact.compaction,
             toon_enabled: config.compact.toon,
             plan_state: PlanState::default(),
@@ -322,6 +324,7 @@ impl AgentEngine {
             compact_state,
             context_state,
             prompt_usage,
+            request_metrics: Default::default(),
             compact_level: config.compact.compaction,
             toon_enabled: config.compact.toon,
             plan_state: PlanState::default(),
@@ -375,7 +378,9 @@ impl AgentEngine {
             .to_tool_defs_filtered(|tool| self.tool_policy.allows(tool.name()));
         let documentation = self.tools.documentation();
         self.tools.register(Box::new(
-            ToolSearchTool::new(definitions).with_documentation(documentation),
+            ToolSearchTool::new(definitions)
+                .with_documentation(documentation)
+                .with_loaded_tools(self.tools.loaded_tools()),
         ));
         self.refresh_local_context_estimate();
     }
@@ -385,7 +390,7 @@ impl AgentEngine {
         let changed = self.tool_policy != tool_policy;
         self.tool_policy = tool_policy;
         if changed {
-            self.refresh_local_context_estimate();
+            self.rebuild_tool_search();
         }
     }
 
@@ -672,6 +677,60 @@ impl AgentEngine {
         }
         project_image_input(&mut messages, image_input, &self.model);
 
+        // Capture sizes before the response mutates history. These are exact
+        // character counts / local estimates, never provider-billed token counts.
+        self.request_metrics = std::collections::BTreeMap::from([
+            ("system_chars".into(), system.chars().count() as u64),
+            ("system_estimated_tokens".into(), estimate_text_tokens(&system)),
+            ("message_count".into(), messages.len() as u64),
+            (
+                "messages_json_chars".into(),
+                serde_json::to_string(&messages).unwrap_or_default().chars().count() as u64,
+            ),
+            ("messages_estimated_tokens".into(), estimate_messages_tokens(&messages)),
+            ("tool_count".into(), tools.len() as u64),
+            (
+                "tools_definition_chars".into(),
+                tools
+                    .iter()
+                    .map(|tool| {
+                        let (description, schema) = tool.advertised();
+                        tool.name.chars().count() as u64
+                            + description.chars().count() as u64
+                            + schema.to_string().chars().count() as u64
+                    })
+                    .sum(),
+            ),
+            (
+                "tools_estimated_tokens".into(),
+                estimate_tool_definitions_tokens(&tools),
+            ),
+            ("memory_estimated_tokens".into(), self.prompt_usage.memory_tokens),
+            ("skills_estimated_tokens".into(), self.prompt_usage.skills_tokens),
+        ]);
+        self.request_metrics.extend(self.prompt_usage.section_chars.clone());
+        for message in &messages {
+            for block in &message.content {
+                let (key, chars) = match block {
+                    ContentBlock::Text { text } => (
+                        if message.role == Role::User {
+                            "user_text_chars"
+                        } else {
+                            "assistant_text_chars"
+                        },
+                        text.chars().count(),
+                    ),
+                    ContentBlock::ToolResult { content, .. } => ("tool_result_chars", content.chars().count()),
+                    ContentBlock::Thinking { thinking, .. } => ("thinking_chars", thinking.chars().count()),
+                    ContentBlock::ToolUse { input, .. } => ("tool_call_json_chars", input.to_string().chars().count()),
+                    ContentBlock::Image { .. } => ("image_count", 1),
+                    ContentBlock::ProviderItem { item, .. } => {
+                        ("provider_item_json_chars", item.to_string().chars().count())
+                    }
+                };
+                *self.request_metrics.entry(key.into()).or_default() += chars as u64;
+            }
+        }
         LlmRequest {
             model: self.model.clone(),
             system,
@@ -684,23 +743,31 @@ impl AgentEngine {
     }
 
     fn tool_definitions_for_turn(&self, kind: TurnKind) -> Vec<ToolDef> {
-        let image_input = self.compat.image_input();
         if kind.disable_tools() {
-            Vec::new()
-        } else if self.is_plan_active() {
-            self.tools.to_tool_defs_filtered(|tool| {
-                self.tool_policy.allows(tool.name())
-                    && (!tool.requires_image_input() || image_input.supports_images())
-                    && tool.category() == ToolCategory::Info
-                    && tool.name() != "EnterPlanMode"
-            })
-        } else {
-            self.tools.to_tool_defs_filtered(|tool| {
-                self.tool_policy.allows(tool.name())
-                    && (!tool.requires_image_input() || image_input.supports_images())
-                    && tool.name() != "ExitPlanMode"
-            })
+            return Vec::new();
         }
+        let image_input = self.compat.image_input();
+        let mut definitions = self.tools.to_tool_defs_filtered(|tool| {
+            self.tool_policy.allows(tool.name())
+                && (!tool.requires_image_input() || image_input.supports_images())
+                && if self.is_plan_active() {
+                    tool.category() == ToolCategory::Info && tool.name() != "EnterPlanMode"
+                } else {
+                    tool.name() != "ExitPlanMode"
+                }
+        });
+        if definitions.iter().any(|tool| tool.name == "ToolSearch") {
+            // The search index stays outside model context. Discovery promotes
+            // selected full schemas for all provider transports on the next round.
+            definitions.retain(|tool| !tool.deferred);
+        } else {
+            // A narrower policy may allow a tool while denying discovery. Do
+            // not make explicitly permitted tools unreachable in that case.
+            for tool in &mut definitions {
+                tool.deferred = false;
+            }
+        }
+        definitions
     }
 
     /// Classify, execute and re-merge one model turn's tool calls.
@@ -1072,6 +1139,35 @@ impl AgentEngine {
 
         self.context_state.replace_with_provider_usage(context_usage);
         self.sync_compact_watermark();
+        let tools = self.tool_definitions_for_turn(TurnKind::Normal);
+        let snapshot = ContextSnapshot::build(
+            &self.model,
+            self.compact_config.context_window,
+            &self.context_state,
+            &self.prompt_usage,
+            self.dynamic_system_tokens(),
+            &tools,
+            &self.messages,
+        );
+        self.output.emit_usage_report(serde_json::json!({
+            "request_id": uuid::Uuid::now_v7().to_string(),
+            "model": self.model,
+            "input_tokens": turn_usage.input_tokens,
+            "output_tokens": turn_usage.output_tokens,
+            "cache_read_tokens": turn_usage.cache_read_tokens,
+            "cache_creation_tokens": turn_usage.cache_creation_tokens,
+            "context_tokens": snapshot.context_usage,
+            "context_window": snapshot.context_window,
+            "request_metrics": self.request_metrics,
+            "breakdown": {
+                "system": snapshot.breakdown.system_prompt,
+                "memory": snapshot.breakdown.memory,
+                "skills": snapshot.breakdown.skills,
+                "tools": snapshot.breakdown.tools,
+                "messages": snapshot.breakdown.messages,
+                "unattributed": snapshot.breakdown.unattributed,
+            },
+        }));
 
         // Cache break detection
         let cache_stats = CacheStats {
@@ -1203,6 +1299,7 @@ impl AgentEngine {
                 &self.model,
                 &self.compact_config,
                 &mut self.compact_state,
+                Some(self.output.as_ref()),
             )
             .await
             {

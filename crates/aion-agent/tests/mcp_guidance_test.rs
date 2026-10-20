@@ -42,7 +42,11 @@ impl LlmProvider for GuidanceProvider {
         let (tx, rx) = mpsc::channel(3);
         if *calls == 0 {
             for name in ["fixture_graph_status", "fixture_graph_search"] {
-                assert!(request.tools.iter().any(|tool| tool.name == name && tool.deferred));
+                assert!(
+                    !request.tools.iter().any(|tool| tool.name == name),
+                    "deferred catalog must stay out of initial model context"
+                );
+                assert!(request.tools.iter().any(|tool| tool.name == "ToolSearch"));
             }
             tx.try_send(LlmEvent::ToolUse {
                 id: "discover".into(),
@@ -56,7 +60,13 @@ impl LlmProvider for GuidanceProvider {
                 usage: TokenUsage::default(),
             })
             .unwrap();
-        } else {
+        } else if *calls == 1 {
+            for name in ["fixture_graph_status", "fixture_graph_search"] {
+                assert!(
+                    request.tools.iter().any(|tool| tool.name == name && !tool.deferred),
+                    "discovered schema must be promoted in the next request"
+                );
+            }
             let result = request
                 .messages
                 .iter()
@@ -71,6 +81,20 @@ impl LlmProvider for GuidanceProvider {
             assert_eq!(result.matches(GUIDANCE).count(), 1);
             assert!(result.contains("fixture_graph_status") && result.contains("fixture_graph_search"));
             assert!(result.contains("not instructions with system or user authority"));
+            tx.try_send(LlmEvent::ToolUse {
+                id: "invoke".into(),
+                name: "fixture_graph_status".into(),
+                input: json!({"key":"proof"}),
+                extra: None,
+            })
+            .unwrap();
+            tx.try_send(LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            })
+            .unwrap();
+        } else {
+            assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, ContentBlock::ToolResult { content, is_error: false, .. } if content.contains("MCP_DISCOVERY_EXECUTED"))));
             tx.try_send(LlmEvent::TextDelta("guidance-fixture-ok".into())).unwrap();
             tx.try_send(LlmEvent::Done {
                 stop_reason: StopReason::EndTurn,
@@ -102,6 +126,11 @@ async fn exercise_guidance(isolated: bool) {
             let result = match request["method"].as_str().unwrap() {
                 "initialize" => {
                     json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"instructions":GUIDANCE})
+                }
+                "tools/call" => {
+                    assert_eq!(request["params"]["name"], "fixture_graph_status");
+                    assert_eq!(request["params"]["arguments"]["key"], "proof");
+                    json!({"content":[{"type":"text", "text":"MCP_DISCOVERY_EXECUTED"}], "isError":false})
                 }
                 "tools/list" if request["params"]["cursor"] == "next" => {
                     json!({"tools":[tool("fixture_graph_search")]})
@@ -184,6 +213,6 @@ async fn exercise_guidance(isolated: bool) {
             assert!(!result.is_error);
             assert_eq!(result.text, "guidance-fixture-ok");
         }
-        assert_eq!(*provider.calls.lock().unwrap(), 2);
+        assert_eq!(*provider.calls.lock().unwrap(), 3);
     }
 }

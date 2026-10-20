@@ -34,6 +34,20 @@ impl LlmProvider for ComposedProvider {
     async fn stream(&self, request: &LlmRequest) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
         let (body, tool_wire_shape) = self.transport.project_body(request, &self.compat)?;
 
+        // Content-free sizes after transport projection expose duplication or
+        // large schemas without logging prompts, tool arguments or credentials.
+        tracing::info!(
+            target: "aion_providers",
+            model = %request.model,
+            wire_body_bytes = body.to_string().len(),
+            wire_messages_bytes = body.get("messages").or_else(|| body.get("contents")).or_else(|| body.get("input")).map(|v| v.to_string().len()).unwrap_or(0),
+            wire_tools_bytes = body.get("tools").map(|v| v.to_string().len()).unwrap_or(0),
+            source_system_chars = request.system.chars().count(),
+            source_message_count = request.messages.len(),
+            source_tool_count = request.tools.len(),
+            "provider request size measurements"
+        );
+
         tracing::debug!(
             target: "aion_providers",
             model = %request.model,

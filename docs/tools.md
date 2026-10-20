@@ -40,6 +40,12 @@ Find and replace exact strings in a file.
 
 ## ExecCommand
 
+Accepts only `cmd`, optional `shell`, and optional `timeout` in milliseconds.
+Unknown arguments and invalid types are rejected before execution. The working
+directory is fixed by the host; `cwd` and `workdir` are not supported arguments.
+Use `git -C /absolute/repository/path ...` or an explicit `cd /absolute/path && ...`
+when a command needs another directory.
+
 Execute a shell command and return the result.
 
 - Default timeout: 120 seconds, max 600 seconds

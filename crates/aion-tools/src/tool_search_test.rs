@@ -4,7 +4,7 @@ use super::*;
 mod tests {
     use super::*;
 
-    fn build_tool_defs() -> Vec<ToolDef> {
+    pub(super) fn build_tool_defs() -> Vec<ToolDef> {
         vec![
             ToolDef {
                 name: "Read".into(),
@@ -144,4 +144,62 @@ async fn guidance_is_scoped_bounded_deduplicated_and_policy_filtered() {
     let values: Vec<Value> = serde_json::from_str(&next.content).unwrap();
     assert_eq!(values.len(), 20);
     assert!(!next.content.contains("next_offset"));
+}
+
+#[tokio::test]
+async fn discovery_promotes_only_the_selected_page_in_one_registry() {
+    let loaded = Arc::new(RwLock::new(HashSet::new()));
+    let other_agent = Arc::new(RwLock::new(HashSet::<String>::new()));
+    let search = ToolSearchTool::new(tests::build_tool_defs()).with_loaded_tools(loaded.clone());
+    let result = search.execute(json!({"query":"plan", "limit":1})).await;
+    assert!(!result.is_error);
+    assert_eq!(*loaded.read().unwrap(), HashSet::from(["EnterPlanMode".to_string()]));
+    assert!(other_agent.read().unwrap().is_empty());
+    assert!(!loaded.read().unwrap().contains("Read"));
+}
+
+#[tokio::test]
+async fn natural_multi_keyword_discovery_does_not_require_an_exact_phrase() {
+    let names = [
+        "browser_tabs_list",
+        "browser_tab_snapshot",
+        "browser_tab_navigate",
+        "press_key",
+        "type_text",
+        "get_app_state",
+    ];
+    let defs = names
+        .into_iter()
+        .map(|name| ToolDef {
+            name: name.into(),
+            description: if name == "get_app_state" {
+                "Inspect desktop window screenshot".into()
+            } else {
+                String::new()
+            },
+            input_schema: json!({"type":"object"}),
+            deferred: true,
+        })
+        .collect();
+    let tool = ToolSearchTool::new(defs);
+    for (query, expected) in [
+        (
+            "browser tabs list snapshot navigate",
+            vec!["browser_tabs_list", "browser_tab_snapshot", "browser_tab_navigate"],
+        ),
+        ("press_key type_text", vec!["press_key", "type_text"]),
+        ("computer use screenshot inspect desktop window", vec!["get_app_state"]),
+        ("get_app_state", vec!["get_app_state"]),
+    ] {
+        let result = tool.execute(json!({"query":query})).await;
+        let values: Vec<Value> = serde_json::from_str(&result.content).unwrap();
+        let found: Vec<_> = values.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert!(
+            expected.iter().all(|name| found.contains(name)),
+            "query {query}: {found:?}"
+        );
+        if query == "get_app_state" {
+            assert_eq!(found, expected);
+        }
+    }
 }

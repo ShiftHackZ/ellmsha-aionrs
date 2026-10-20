@@ -75,6 +75,7 @@ mod tests_set_config {
             compact_state: super::CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
+            request_metrics: Default::default(),
             compact_level: CompactLevel::default(),
             toon_enabled: false,
             plan_state: Default::default(),
@@ -82,6 +83,46 @@ mod tests_set_config {
             cache_detector: super::CacheBreakDetector::new(),
             commands: crate::commands::default_registry(),
         }
+    }
+
+    #[test]
+    fn deferred_tools_remain_callable_when_discovery_is_denied_by_policy() {
+        use crate::engine::TurnKind;
+        use crate::plan::tools::EnterPlanModeTool;
+        use crate::tool_policy::ToolPolicy;
+        use std::sync::atomic::AtomicBool;
+
+        let mut engine = make_engine("fixture");
+        engine
+            .tools
+            .register(Box::new(EnterPlanModeTool::new(Arc::new(AtomicBool::new(false)))));
+        engine.set_tool_policy(ToolPolicy::allow_only(["EnterPlanMode"]));
+        let tools = engine.tool_definitions_for_turn(TurnKind::Normal);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "EnterPlanMode");
+        assert!(!tools[0].deferred);
+    }
+
+    #[test]
+    fn discovery_does_not_expose_policy_denied_schemas_after_a_policy_change() {
+        use crate::engine::TurnKind;
+        use crate::plan::tools::EnterPlanModeTool;
+        use crate::tool_policy::ToolPolicy;
+        use std::sync::atomic::AtomicBool;
+
+        let mut engine = make_engine("fixture");
+        engine
+            .tools
+            .register(Box::new(EnterPlanModeTool::new(Arc::new(AtomicBool::new(false)))));
+        engine.set_tool_policy(ToolPolicy::allow_only(["ToolSearch"]));
+        assert_eq!(engine.tool_definitions_for_turn(TurnKind::Normal).len(), 1);
+        assert!(engine.tools.get("ToolSearch").is_some());
+        assert!(
+            !engine
+                .tool_definitions_for_turn(TurnKind::Normal)
+                .iter()
+                .any(|tool| tool.name == "EnterPlanMode")
+        );
     }
 
     fn make_engine_with_compat(model: &str, compat: ProviderCompat) -> super::AgentEngine {
@@ -454,6 +495,7 @@ mod tests_phase6 {
             compact_state: super::CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
+            request_metrics: Default::default(),
             compact_level: CompactLevel::default(),
             toon_enabled: false,
             plan_state: Default::default(),
@@ -641,6 +683,7 @@ mod tests_compact {
         tool_results: Mutex<Vec<(String, String, bool, String)>>,
         errors: Mutex<Vec<String>>,
         infos: Mutex<Vec<String>>,
+        usage_reports: Mutex<Vec<serde_json::Value>>,
     }
 
     impl OutputSink for RecordingOutput {
@@ -657,6 +700,10 @@ mod tests_compact {
         }
         fn emit_stream_start(&self, _: &str) {}
         fn emit_stream_end(&self, _: &str, _: usize, _: u64, _: u64, _: u64, _: u64) {}
+
+        fn emit_usage_report(&self, report: serde_json::Value) {
+            self.usage_reports.lock().unwrap().push(report);
+        }
 
         fn emit_error(&self, msg: &str) {
             self.errors.lock().unwrap().push(msg.to_string());
@@ -755,6 +802,7 @@ mod tests_compact {
             compact_state,
             context_state: Default::default(),
             prompt_usage: Default::default(),
+            request_metrics: Default::default(),
             compact_level: CompactLevel::default(),
             toon_enabled: false,
             plan_state: Default::default(),
@@ -880,6 +928,62 @@ mod tests_compact {
                 "Tool execution canceled by user".into()
             )
         );
+    }
+
+    #[test]
+    fn usage_reports_are_per_request_not_session_totals_and_omissions_are_not_zero_measurements() {
+        let output = Arc::new(RecordingOutput::default());
+        let mut engine =
+            make_compact_engine_with_output(CompactConfig::default(), CompactState::new(), vec![], output.clone());
+        for input in [100, 150] {
+            engine.record_turn_usage(&TokenUsage {
+                input_tokens: input,
+                output_tokens: 20,
+                ..Default::default()
+            });
+        }
+        engine.record_turn_usage(&TokenUsage::default());
+        let reports = output.usage_reports.lock().unwrap();
+        assert_eq!(
+            reports
+                .iter()
+                .map(|r| r["input_tokens"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![100, 150]
+        );
+        assert_ne!(reports[0]["request_id"], reports[1]["request_id"]);
+        assert_eq!(reports[1]["context_tokens"], 170);
+    }
+
+    #[test]
+    fn request_metrics_capture_pre_response_sizes_without_retaining_payloads() {
+        let output = Arc::new(RecordingOutput::default());
+        let mut engine =
+            make_compact_engine_with_output(CompactConfig::default(), CompactState::new(), vec![], output.clone());
+        engine.system_prompt = "secret system".into();
+        engine.messages.push(Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "привет".into()
+            }],
+        ));
+        let _request = engine.build_request(crate::turn::TurnKind::Normal);
+        engine.messages.push(Message::new(
+            Role::Assistant,
+            vec![ContentBlock::Text {
+                text: "new output".into(),
+            }],
+        ));
+        engine.record_turn_usage(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        });
+        let reports = output.usage_reports.lock().unwrap();
+        let metrics = &reports[0]["request_metrics"];
+        assert_eq!(metrics["user_text_chars"], 6);
+        assert_eq!(metrics["message_count"], 1);
+        assert!(!metrics.to_string().contains("secret") && metrics.get("assistant_text_chars").is_none());
     }
 
     #[test]
@@ -1234,15 +1338,24 @@ mod tests_compact {
             Message::new(Role::Assistant, vec![ContentBlock::Text { text: "second".into() }]),
             Message::new(Role::User, vec![ContentBlock::Text { text: "third".into() }]),
         ];
-        let mut engine = make_compact_engine(config, state, messages);
+        let output = Arc::new(RecordingOutput::default());
+        let mut engine = make_compact_engine_with_output(config, state, messages, output.clone());
         engine.provider = Arc::new(SuccessfulProvider {
-            usage: TokenUsage::default(),
+            usage: TokenUsage {
+                input_tokens: 60,
+                output_tokens: 10,
+                ..Default::default()
+            },
         });
         engine.context_state.replace_with_provider_usage(60);
         engine.sync_compact_watermark();
 
         engine.run_compaction().await.unwrap();
 
+        let reports = output.usage_reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["input_tokens"], 60);
+        assert_eq!(reports[0]["context_reported"], false);
         assert_eq!(engine.context_state.compact_count, 1);
         assert_eq!(engine.context_state.source, ContextUsageSource::LocalProjected);
         assert_eq!(engine.messages.len(), 2);
@@ -1460,6 +1573,7 @@ mod tests_plan_mode {
             compact_state: CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
+            request_metrics: Default::default(),
             compact_level: CompactLevel::default(),
             toon_enabled: false,
             plan_state: PlanState::default(),
@@ -1683,6 +1797,7 @@ mod tests_handle_command {
             compact_state: CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
+            request_metrics: Default::default(),
             compact_level: CompactLevel::default(),
             toon_enabled: false,
             plan_state: Default::default(),
@@ -2713,6 +2828,7 @@ mod tests_tool_policy_enforcement {
             compact_state: CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
+            request_metrics: Default::default(),
             compact_level: CompactLevel::default(),
             toon_enabled: false,
             plan_state: Default::default(),

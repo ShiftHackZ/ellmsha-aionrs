@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use aion_config::shell::{resolve_shell, shell_command_builder};
@@ -14,6 +15,14 @@ use crate::Tool;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecCommandInput {
+    cmd: String,
+    shell: Option<String>,
+    timeout: Option<u64>,
+}
 
 pub struct ExecCommandTool {
     cwd: PathBuf,
@@ -64,6 +73,8 @@ impl Tool for ExecCommandTool {
          - Write files: use Write (not echo or cat with heredoc)\n\n\
          # Instructions\n\
          - Use absolute paths to avoid working directory confusion.\n\
+         - The working directory is fixed for this tool instance. There is no cwd or workdir parameter. \
+         Use `git -C /absolute/repository/path ...` or an explicit `cd /absolute/path && ...` when needed.\n\
          - When issuing multiple independent commands, make parallel tool calls \
          instead of chaining them. Use `&&` only when commands depend on each other.\n\
          - You may specify an optional timeout in milliseconds (default 120000, max 600000).\n\n\
@@ -89,7 +100,8 @@ impl Tool for ExecCommandTool {
                     "description": "Timeout in milliseconds (default 120000, max 600000)"
                 }
             },
-            "required": ["cmd"]
+            "required": ["cmd"],
+            "additionalProperties": false
         })
     }
 
@@ -98,14 +110,21 @@ impl Tool for ExecCommandTool {
     }
 
     async fn execute(&self, input: Value) -> ToolResult {
-        let Some(command) = input["cmd"].as_str() else {
-            return ToolResult {
-                content: "Missing required parameter: cmd".to_string(),
-                is_error: true,
-            };
+        let input: ExecCommandInput = match serde_json::from_value(input) {
+            Ok(input) => input,
+            Err(error) => {
+                return ToolResult {
+                    content: format!(
+                        "Invalid ExecCommand arguments: {error}. Supported parameters: cmd, shell, timeout. \
+                         The working directory is fixed; use git -C /absolute/path or an explicit cd command, \
+                         not a cwd or workdir parameter."
+                    ),
+                    is_error: true,
+                };
+            }
         };
 
-        let shell = match resolve_shell(input["shell"].as_str()) {
+        let shell = match resolve_shell(input.shell.as_deref()) {
             Ok(shell) => shell,
             Err(err) => {
                 return ToolResult {
@@ -122,15 +141,12 @@ impl Tool for ExecCommandTool {
             "ExecCommandTool executing"
         );
 
-        let timeout_ms = input["timeout"]
-            .as_u64()
-            .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .min(MAX_TIMEOUT_MS);
+        let timeout_ms = input.timeout.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
         let timeout = Duration::from_millis(timeout_ms);
 
         let cwd = self.cwd.clone();
-        let mut command_builder = shell_command_builder(&shell, command, false);
+        let mut command_builder = shell_command_builder(&shell, &input.cmd, false);
         command_builder.envs(&self.runtime_env).current_dir(&cwd);
 
         let result = CommandRunner::new(command_builder).timeout(timeout).run().await;

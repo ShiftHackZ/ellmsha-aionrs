@@ -61,7 +61,7 @@ setup, package downloads, remote authentication, or slow network handshakes.
 
 ## Deferred Loading
 
-MCP tools can be registered as "deferred" — their full schema is not loaded into the system prompt at startup, reducing initial token usage. The LLM discovers deferred tools via the `ToolSearch` tool when needed.
+MCP tools can be registered as "deferred" — their full schema is not sent to the model at startup, reducing initial token usage. The LLM discovers deferred tools via the `ToolSearch` tool when needed.
 
 ```toml
 [mcp.servers.large-toolset]
@@ -73,10 +73,20 @@ deferred = true    # Don't load tool schemas at startup
 
 | `deferred` | Behavior |
 |------------|----------|
-| `false` | Tool schemas included in system prompt at startup |
+| `false` | Tool schemas included in provider requests at startup |
 | `true` (default) | Tools registered but schemas loaded on-demand via ToolSearch |
 
-Use `deferred = true` for MCP servers with many tools to keep the initial system prompt small.
+Deferred tools stay in the authorized host-side search index, entirely outside
+initial provider tool definitions. `ToolSearch` promotes only its selected page
+of full schemas into subsequent requests. Discovery state belongs to one agent;
+parents, children and skill forks cannot load schemas into each other's context.
+If a restricted tool policy permits a tool but denies ToolSearch, its full schema
+is advertised directly so that explicit permission does not become unusable.
+The desktop host enables deferral for every injected MCP server.
+
+Skills use a bounded name/description catalog; full bodies enter model context
+through `Skill` only when selected. Ordinary native children now retain the Skill
+tool and managed skill directories as well as inherited MCP connections.
 
 ## Tool Naming
 
@@ -108,8 +118,7 @@ rounds, a tools-changed notification or a 60-second TTL triggers discovery. Serv
 refresh concurrently with a three-second total budget per server; a failed refresh
 retains its last complete catalog. Successful refreshes replace removed tools and
 changed schemas in the existing registry and rebuild the filtered ToolSearch
-snapshot. A compact schema revision remains visible in deferred descriptions, so
-the model can reload schemas that differ from earlier ToolSearch results. Active tool calls are never interrupted for refresh.
+snapshot. Changed or removed schemas lose their loaded state and require discovery again. Active tool calls are never interrupted for refresh.
 
 The TTL covers Streamable HTTP without an idle notification stream and buffered
 stdio notifications. There is no background polling or automatic server restart.

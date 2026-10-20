@@ -26,6 +26,22 @@ pub trait OutputSink: Send + Sync {
         cache_read_tokens: u64,
     );
 
+    /// Report one completed provider request without exposing prompt content.
+    fn emit_usage_report(&self, _report: serde_json::Value) {}
+
+    /// Billable internal work must not overwrite the visible chat's context.
+    fn emit_auxiliary_usage(&self, model: &str, usage: &aion_types::message::TokenUsage) {
+        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+            return;
+        }
+        self.emit_usage_report(serde_json::json!({
+            "request_id":uuid::Uuid::now_v7().to_string(),"model":model,
+            "input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,
+            "cache_read_tokens":usage.cache_read_tokens,"cache_creation_tokens":usage.cache_creation_tokens,
+            "context_tokens":0,"context_window":0,"context_reported":false,"breakdown":{}
+        }));
+    }
+
     /// Display error
     fn emit_error(&self, msg: &str);
 

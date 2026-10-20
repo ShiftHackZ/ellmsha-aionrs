@@ -40,6 +40,23 @@ pub struct ToolDef {
     pub deferred: bool,
 }
 
+impl ToolDef {
+    /// Provider-neutral advertised schema; full definitions stay in the registry.
+    pub fn advertised(&self) -> (String, Value) {
+        if self.deferred {
+            (
+                format!(
+                    "(Deferred) {} — Use ToolSearch to load full schema before calling.",
+                    truncate_deferred_description(&self.description)
+                ),
+                serde_json::json!({"type":"object", "properties":{}}),
+            )
+        } else {
+            (self.description.clone(), self.input_schema.clone())
+        }
+    }
+}
+
 /// Result from executing a tool
 #[derive(Debug, Clone)]
 pub struct ToolResult {

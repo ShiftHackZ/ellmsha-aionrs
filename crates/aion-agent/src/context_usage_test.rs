@@ -49,6 +49,7 @@ mod tests {
             skills_tokens: 25,
             memory_files: vec!["MEMORY.md".into()],
             skills: vec!["review".into()],
+            section_chars: Default::default(),
         };
         let tools = vec![ToolDef {
             name: "Read".into(),

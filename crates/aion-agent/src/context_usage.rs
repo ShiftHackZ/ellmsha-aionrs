@@ -122,6 +122,7 @@ pub(crate) struct PromptUsage {
     pub(crate) skills_tokens: u64,
     pub(crate) memory_files: Vec<String>,
     pub(crate) skills: Vec<String>,
+    pub(crate) section_chars: std::collections::BTreeMap<String, u64>,
 }
 
 impl PromptUsage {
@@ -149,6 +150,7 @@ impl PromptUsage {
             skills_tokens,
             memory_files,
             skills,
+            section_chars: Default::default(),
         }
     }
 
@@ -316,7 +318,8 @@ fn estimate_message_tokens(message: &Message) -> u64 {
 }
 
 fn estimate_tool_tokens(tool: &ToolDef) -> u64 {
-    estimate_chars(tool.name.len() + tool.description.len() + tool.input_schema.to_string().len())
+    let (description, schema) = tool.advertised();
+    estimate_chars(tool.name.len() + description.len() + schema.to_string().len())
 }
 
 fn estimate_chars(chars: usize) -> u64 {

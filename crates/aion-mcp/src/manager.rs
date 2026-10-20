@@ -34,6 +34,7 @@ struct McpServer {
     instructions: Option<String>,
     /// Whether the server declared resources capability in its initialize response
     supports_resources: bool,
+    supports_tools: bool,
 }
 
 /// Manages connections to multiple MCP servers
@@ -208,7 +209,15 @@ impl McpManager {
         transport.notify(&initialized_notification).await?;
 
         // 4. Fully validate the catalog before publishing any tools.
-        let tools = Self::list_tools(transport.as_ref(), &AtomicU64::new(2)).await?;
+        let supports_tools = init_result
+            .capabilities
+            .get("tools")
+            .is_some_and(|value| !value.is_null());
+        let tools = if supports_tools {
+            Self::list_tools(transport.as_ref(), &AtomicU64::new(2)).await?
+        } else {
+            Vec::new()
+        };
         let instructions = init_result
             .instructions
             .filter(|text| !text.trim().is_empty())
@@ -219,6 +228,7 @@ impl McpManager {
             tools: RwLock::new(tools),
             instructions,
             supports_resources,
+            supports_tools,
         })
     }
 
@@ -288,6 +298,9 @@ impl McpManager {
         }
         let mut pending = FuturesUnordered::new();
         for (name, server) in &self.servers {
+            if !server.supports_tools {
+                continue;
+            }
             pending.push(async move {
                 (
                     name,
@@ -493,6 +506,7 @@ impl McpManager {
                     tools: RwLock::new(vec![]),
                     instructions: None,
                     supports_resources,
+                    supports_tools: true,
                 },
             );
         }

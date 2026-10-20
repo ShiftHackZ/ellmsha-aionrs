@@ -1,7 +1,7 @@
 use aion_config::compat::{self, ProviderCompat, ToolWireShape};
 use aion_config::schema::legalize_json_schema;
 use aion_types::llm::{LlmRequest, ThinkingConfig};
-use aion_types::tool::{ToolDef, truncate_deferred_description};
+use aion_types::tool::ToolDef;
 use serde_json::{Value, json};
 use std::fmt;
 
@@ -275,18 +275,8 @@ fn project_anthropic_input_schema_tool(tool: &ToolDef) -> Value {
 }
 
 fn tool_description_and_schema(tool: &ToolDef) -> (String, Value) {
-    if tool.deferred {
-        let short_desc = truncate_deferred_description(&tool.description);
-        (
-            format!("(Deferred) {short_desc} — Use ToolSearch to load full schema before calling."),
-            legalize_json_schema(&json!({
-                "type": "object",
-                "properties": {}
-            })),
-        )
-    } else {
-        (tool.description.clone(), legalize_json_schema(&tool.input_schema))
-    }
+    let (description, schema) = tool.advertised();
+    (description, legalize_json_schema(&schema))
 }
 
 fn projected_tool_schema_mut(tool: &mut Value, shape: ResolvedToolWireShape) -> Option<&mut Value> {

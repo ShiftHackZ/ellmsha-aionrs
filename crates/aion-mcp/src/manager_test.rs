@@ -98,6 +98,7 @@ mod tests {
             tools: RwLock::new(vec![]),
             instructions: None,
             supports_resources: false,
+            supports_tools: true,
         }
     }
 
@@ -391,7 +392,7 @@ mod tests {
 async fn initialized_guidance_and_paginated_catalog_are_preserved() {
     use tests::MockTransport;
     let server = McpManager::initialize_transport("fixture", Box::new(MockTransport::new(vec![
-        json!({"protocolVersion":"2025-03-26", "capabilities":{}, "instructions":"Inspect index status before searching."}),
+        json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}}, "instructions":"Inspect index status before searching."}),
         json!({"tools":[{"name":"second", "inputSchema":{"type":"object"}}], "nextCursor":"page-2"}),
         json!({"tools":[{"name":"first", "inputSchema":{"type":"object"}}]})
     ]))).await.unwrap();
@@ -458,7 +459,7 @@ async fn refresh_replaces_schema_removes_tools_and_retains_complete_catalog_on_f
     let server = McpManager::initialize_transport(
         "fixture",
         Box::new(MockTransport::new(vec![
-            json!({"protocolVersion":"2025-03-26","capabilities":{}, "instructions":"Use only this fixture."}),
+            json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}}, "instructions":"Use only this fixture."}),
             json!({"tools":[tool("keep", "old"),tool("remove", "old")]}),
             json!({"tools":[tool("keep", "new"),tool("add", "new")]}),
             json!({"tools":[tool("partial", "bad")], "nextCursor":"broken"}),
@@ -504,4 +505,30 @@ async fn refresh_replaces_schema_removes_tools_and_retains_complete_catalog_on_f
     assert!(catalog.refresh().await);
     catalog.apply(&mut registry);
     assert!(registry.tool_names().is_empty());
+}
+
+#[tokio::test]
+async fn resource_only_skill_server_does_not_require_tools_capability() {
+    let transport = tests::MockTransport::new(vec![
+        json!({"protocolVersion":"2025-03-26", "capabilities":{"resources":{}}}),
+        json!({"resources":[{"uri":"skill://qa-proof", "name":"qa-proof"}]}),
+        json!({"contents":[{"uri":"skill://qa-proof", "text":"QA_SKILL_BODY"}]}),
+    ]);
+    let server = McpManager::initialize_transport("skills-only", Box::new(transport))
+        .await
+        .unwrap();
+    assert!(!server.supports_tools);
+    let manager = McpManager {
+        servers: HashMap::from([("skills-only".into(), server)]),
+        next_id: AtomicU64::new(10),
+        last_refresh: Mutex::new(Instant::now()),
+    };
+    assert_eq!(
+        manager.list_resources("skills-only").await.unwrap()[0].uri,
+        "skill://qa-proof"
+    );
+    assert_eq!(
+        manager.read_resource("skills-only", "skill://qa-proof").await.unwrap(),
+        "QA_SKILL_BODY"
+    );
 }

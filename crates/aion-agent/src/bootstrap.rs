@@ -34,7 +34,7 @@ use crate::plan::tools::{EnterPlanModeTool, ExitPlanModeTool};
 use crate::session::Session;
 use crate::skill_tool::SkillTool;
 use crate::spawn_tool::SpawnTool;
-use crate::spawner::{AgentSpawner, ChildRouter};
+use crate::spawner::{AgentSpawner, ChildPromptPreflight, ChildRouter};
 use crate::tool_policy::ToolPolicy;
 
 /// Result of bootstrapping an agent engine with all features initialized.
@@ -71,6 +71,7 @@ pub struct AgentBootstrap {
     // Optional externally supplied runtime state.
     provider: Option<Arc<dyn LlmProvider>>,
     child_router: Option<Arc<dyn ChildRouter>>,
+    child_preflight: Option<Arc<dyn ChildPromptPreflight>>,
     host_delegation: bool,
     host_approval: Option<(Arc<ToolApprovalManager>, Arc<dyn ProtocolEmitter>)>,
     resume_session: Option<Session>,
@@ -91,7 +92,7 @@ struct BootstrapEnvironment {
 pub(crate) struct McpBootstrap {
     pub(crate) catalog: Option<McpToolCatalog>,
     // Active manager used for MCP-backed skills.
-    manager: Option<Arc<McpManager>>,
+    pub(crate) manager: Option<Arc<McpManager>>,
 
     // Managers retained by the caller for lifecycle ownership.
     managers: Vec<Arc<McpManager>>,
@@ -112,6 +113,7 @@ impl AgentBootstrap {
             output,
             provider: None,
             child_router: None,
+            child_preflight: None,
             host_delegation: false,
             host_approval: None,
             resume_session: None,
@@ -127,6 +129,11 @@ impl AgentBootstrap {
     }
 
     /// Route host-managed child assignments while retaining their inherited tools.
+    pub fn child_preflight(mut self, preflight: Arc<dyn ChildPromptPreflight>) -> Self {
+        self.child_preflight = Some(preflight);
+        self
+    }
+
     pub fn child_router(mut self, router: Arc<dyn ChildRouter>) -> Self {
         self.child_router = Some(router);
         self
@@ -362,13 +369,18 @@ impl AgentBootstrap {
             .filter(|skill| self.tool_policy.allows("Skill") && !skill.disable_model_invocation)
             .map(|skill| skill.name.clone())
             .collect();
-        let prompt_usage = PromptUsage::from_sections(
+        let mut prompt_usage = PromptUsage::from_sections(
             &system_prompt,
             memory_prompt,
             skills_prompt,
             memory_files,
             visible_skills,
         );
+        prompt_usage.section_chars = prompt_cache
+            .sections
+            .iter()
+            .map(|(key, text)| (format!("system_{key}_chars"), text.chars().count() as u64))
+            .collect();
         self.config.system_prompt = Some(system_prompt);
         prompt_usage
     }
@@ -404,6 +416,9 @@ impl AgentBootstrap {
             self.runtime_env.clone(),
             self.tool_policy.clone(),
         );
+        let spawner = spawner
+            .with_usage_output(self.output.clone())
+            .with_skill_dirs(self.extra_skill_dirs.clone());
         let spawner = if let Some(flag) = plan_active_flag {
             spawner.with_parent_plan(flag)
         } else {
@@ -411,6 +426,11 @@ impl AgentBootstrap {
         };
         let spawner = if let Some((manager, writer)) = &self.host_approval {
             spawner.with_host_approval(manager.clone(), writer.clone())
+        } else {
+            spawner
+        };
+        let spawner = if let Some(preflight) = &self.child_preflight {
+            spawner.with_child_preflight(preflight.clone())
         } else {
             spawner
         };
@@ -436,7 +456,9 @@ impl AgentBootstrap {
     fn register_tool_search(&self, registry: &mut ToolRegistry) {
         let tool_defs_snapshot = registry.to_tool_defs_filtered(|tool| self.tool_policy.allows(tool.name()));
         registry.register(Box::new(
-            ToolSearchTool::new(tool_defs_snapshot).with_documentation(registry.documentation()),
+            ToolSearchTool::new(tool_defs_snapshot)
+                .with_documentation(registry.documentation())
+                .with_loaded_tools(registry.loaded_tools()),
         ));
     }
 

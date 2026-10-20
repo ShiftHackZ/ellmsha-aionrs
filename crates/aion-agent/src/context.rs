@@ -93,7 +93,7 @@ However, if one call depends on a previous result, run them sequentially.
  - Prefer Edit over Write for modifying existing files — Edit sends only \
 the diff, which is easier to review.
  - Always Read a file before editing it.
- - Some tools are deferred — only their names are visible. Before calling \
+ - Some tools are deferred and are not listed until discovered. Before calling \
 a deferred tool, use ToolSearch to load its full schema first."
             .to_string();
     }
@@ -131,7 +131,7 @@ a deferred tool, use ToolSearch to load its full schema first."
     }
     if tool_policy.allows("ToolSearch") {
         guidance.push(
-            " - Some tools are deferred — only their names are visible. Before calling a deferred tool, use ToolSearch to load its full schema first."
+            " - Some tools are deferred and are not listed until discovered. Before calling a deferred tool, use ToolSearch to load its full schema first."
                 .to_string(),
         );
     }

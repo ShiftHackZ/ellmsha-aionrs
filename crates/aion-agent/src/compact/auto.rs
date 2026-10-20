@@ -91,6 +91,18 @@ pub async fn autocompact(
     config: &CompactConfig,
     state: &mut CompactState,
 ) -> Result<CompactResult, CompactError> {
+    autocompact_with_output(provider, messages, model, config, state, None).await
+}
+
+/// Same compaction contract, with completed provider usage forwarded privately.
+pub async fn autocompact_with_output(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    model: &str,
+    config: &CompactConfig,
+    state: &mut CompactState,
+    output: Option<&dyn crate::output::OutputSink>,
+) -> Result<CompactResult, CompactError> {
     // Circuit breaker check
     if state.is_circuit_broken(config) {
         return Err(CompactError::CircuitBroken {
@@ -121,7 +133,12 @@ pub async fn autocompact(
 
         match provider.stream(&request).await {
             Ok(rx) => match collect_stream_text(rx).await {
-                Ok((text, _usage)) => break text,
+                Ok((text, usage)) => {
+                    if let Some(output) = output {
+                        output.emit_auxiliary_usage(model, &usage);
+                    }
+                    break text;
+                }
                 Err(e) => {
                     state.record_failure();
                     return Err(e);

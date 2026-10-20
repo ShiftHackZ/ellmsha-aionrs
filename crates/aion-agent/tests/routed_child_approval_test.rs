@@ -189,7 +189,11 @@ async fn ordinary_parallel_children_preserve_panic_isolation() {
     );
     let results = spawner.spawn_parallel(vec![task(dir.path()), task(dir.path())]).await;
     assert_eq!(results.len(), 2);
-    assert!(results.iter().all(|r| r.is_error && r.text.contains("Task join error")));
+    assert!(
+        results
+            .iter()
+            .all(|r| r.is_error && r.text == "Sub-agent task panicked")
+    );
 }
 
 struct MixedRouter;
@@ -275,6 +279,12 @@ impl ChildRouter for PausedRouter {
 }
 #[tokio::test]
 async fn stopping_parent_cancels_parallel_children_before_any_later_mutation() {
+    for routed in [false, true] {
+        exercise_parent_cancellation(routed).await;
+    }
+}
+
+async fn exercise_parent_cancellation(routed: bool) {
     let dir = tempfile::tempdir().unwrap();
     let manager = Arc::new(ToolApprovalManager::new());
     manager.set_mode(SessionMode::Yolo);
@@ -284,17 +294,25 @@ async fn stopping_parent_cancels_parallel_children_before_any_later_mutation() {
     });
     let (started, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let gate = Arc::new(tokio::sync::Notify::new());
-    let spawner = AgentSpawner::new(
-        Arc::new(MockLlmProvider::with_text_response("unused")),
-        test_config(),
-        dir.path().into(),
-        ToolPolicy::Unrestricted,
-    )
-    .with_child_router(Arc::new(PausedRouter {
-        started,
+    let provider = Arc::new(PausedProvider {
+        inner: MockLlmProvider::with_tool_use(
+            "after-stop",
+            "Write",
+            serde_json::json!({"file_path":dir.path().join("ordinary.txt"),"content":"must not be written"}),
+        ),
+        started: started.clone(),
         gate: gate.clone(),
-    }))
-    .with_host_approval(manager, writer);
+    });
+    let spawner = AgentSpawner::new(provider, test_config(), dir.path().into(), ToolPolicy::Unrestricted);
+    let spawner = if routed {
+        spawner.with_child_router(Arc::new(PausedRouter {
+            started,
+            gate: gate.clone(),
+        }))
+    } else {
+        spawner
+    };
+    let spawner = spawner.with_host_approval(manager, writer);
     let first = dir.path().join("first.txt");
     let second = dir.path().join("second.txt");
     let tasks = vec![task(&first), task(&second)];
@@ -311,4 +329,43 @@ async fn stopping_parent_cancels_parallel_children_before_any_later_mutation() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(!first.exists());
     assert!(!second.exists());
+    assert!(!dir.path().join("ordinary.txt").exists());
+}
+
+#[tokio::test]
+async fn ordinary_children_and_skill_forks_do_not_bypass_live_parent_approval() {
+    use aion_agent::spawner::{ForkOverrides, Spawner};
+    let dir = tempfile::tempdir().unwrap();
+    for fork in [false, true] {
+        let manager = Arc::new(ToolApprovalManager::new());
+        manager.set_mode(SessionMode::Default);
+        let review = Arc::new(Review {
+            manager: manager.clone(),
+            ids: Mutex::new(Vec::new()),
+        });
+        let path = dir.path().join(if fork { "deny-fork.txt" } else { "deny-child.txt" });
+        let provider = Router {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+        .resolve(&path.to_string_lossy())
+        .await
+        .unwrap()
+        .provider;
+        let mut config = test_config();
+        config.tools.auto_approve = true; // Stale yolo must not override the live host.
+        let spawner = AgentSpawner::new(provider, config, dir.path().into(), ToolPolicy::Unrestricted)
+            .with_host_approval(manager, review.clone());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if fork {
+                spawner.spawn_fork(task(&path), ForkOverrides::default()).await
+            } else {
+                spawner.spawn_one(task(&path)).await
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert!(!path.exists(), "denied child writes must never execute");
+        assert_eq!(review.ids.lock().unwrap().len(), 1);
+    }
 }

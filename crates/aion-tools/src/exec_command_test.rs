@@ -6,6 +6,36 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn invalid_arguments_are_rejected_before_any_command_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ExecCommandTool::new(dir.path().to_path_buf());
+        let command = "echo must-not-execute > unexpected.txt";
+        for unknown in ["cwd", "workdir", "time_out"] {
+            let mut input = json!({"cmd": command});
+            input[unknown] = json!("other-directory");
+            let result = tool.execute(input).await;
+            assert!(result.is_error, "unexpected success: {}", result.content);
+            assert!(result.content.contains(&format!("unknown field `{unknown}`")));
+            assert!(result.content.contains("git -C /absolute/path"));
+            assert!(!dir.path().join("unexpected.txt").exists());
+        }
+        for input in [
+            json!({"cmd": command, "shell": 1}),
+            json!({"cmd": command, "timeout": "1000"}),
+            json!({"cmd": command, "timeout": -1}),
+            json!({"cmd": 1}),
+            json!({}),
+            json!([]),
+        ] {
+            let result = tool.execute(input).await;
+            assert!(result.is_error, "unexpected success: {}", result.content);
+            assert!(result.content.starts_with("Invalid ExecCommand arguments:"));
+            assert!(!dir.path().join("unexpected.txt").exists());
+        }
+        assert_eq!(tool.input_schema()["additionalProperties"], false);
+    }
+
+    #[tokio::test]
     async fn execute_echo_returns_stdout() {
         let tool = ExecCommandTool::new(std::env::temp_dir());
         let input = json!({"cmd": "echo hello_exec_command"});
