@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cache_diagnostics::{CacheBreakDetector, CacheDiagnostic, CacheStats};
 use crate::commands::{CommandContext, CommandRegistry, CommandResult, SlashCommand, default_registry};
-use crate::compact::auto::{CompactError, autocompact_with_output as autocompact, should_autocompact};
+use crate::compact::auto::{CompactError, autocompact_with_guidance as autocompact, should_autocompact};
 use crate::compact::emergency::is_at_emergency_limit;
 use crate::compact::estimate::{estimate_tokens_from_tool_image, estimate_tokens_from_tool_result};
 use crate::compact::micro::{microcompact, should_microcompact};
@@ -20,6 +20,7 @@ use crate::orchestration::{ExecutionControl, execute_tool_calls, execute_tool_ca
 use crate::output::OutputSink;
 use crate::plan::prompt::plan_mode_instructions;
 use crate::plan::state::PlanState;
+use crate::request_guidance::RequestGuidance;
 use crate::session::{Session, SessionManager};
 use crate::stream::StreamOutcome;
 use crate::tool_call::{
@@ -80,6 +81,8 @@ pub struct AgentEngine {
     // Conversation and run state.
     /// Conversation history used to build the next provider request.
     messages: Vec<Message>,
+    /// Complete current host guidance, outside persisted/compactable history.
+    request_guidance: Option<RequestGuidance>,
     /// Cumulative token usage across the active session/run.
     total_usage: TokenUsage,
     /// Output message ID for the currently streaming run.
@@ -199,6 +202,7 @@ impl AgentEngine {
             system_prompt,
             reasoning_effort: None,
             messages: Vec::new(),
+            request_guidance: None,
             total_usage: TokenUsage::default(),
             msg_id: String::new(),
             max_turns_per_run: config.max_turns,
@@ -298,6 +302,7 @@ impl AgentEngine {
             system_prompt,
             reasoning_effort: None,
             messages: session.messages.clone(),
+            request_guidance: None,
             total_usage: session.total_usage.clone(),
             msg_id: String::new(),
             max_turns_per_run: config.max_turns,
@@ -472,14 +477,22 @@ impl AgentEngine {
     /// `ContentBlock::Text` and no markers are parsed. Slash commands are
     /// intercepted before any LLM call.
     pub async fn run(&mut self, user_input: &str, msg_id: &str) -> Result<AgentResult, AgentError> {
-        // Slash command interception — before any LLM call.
-        if let Some(result) = self.handle_command(user_input).await? {
-            return Ok(result);
-        }
+        self.run_with_guidance(user_input, msg_id, None).await
+    }
+
+    /// Run a text task with complete host-validated guidance for this run only.
+    /// The snapshot is sent once per request, including tool continuations,
+    /// without persisting it or accumulating older snapshots in history.
+    pub(crate) async fn run_with_guidance(
+        &mut self,
+        user_input: &str,
+        msg_id: &str,
+        guidance: Option<String>,
+    ) -> Result<AgentResult, AgentError> {
         let blocks = vec![ContentBlock::Text {
             text: user_input.to_string(),
         }];
-        self.run_with_blocks(blocks, msg_id).await
+        self.run_with_blocks_and_guidance(blocks, msg_id, guidance).await
     }
 
     /// Run the agent loop with structured content blocks.
@@ -493,6 +506,23 @@ impl AgentEngine {
         content_blocks: Vec<ContentBlock>,
         msg_id: &str,
     ) -> Result<AgentResult, AgentError> {
+        self.run_with_blocks_and_guidance(content_blocks, msg_id, None).await
+    }
+
+    /// Structured equivalent of [`Self::run_with_guidance`]. The caller owns
+    /// validation and freshness; `None` clears any prior run's snapshot.
+    /// User content is never parsed to identify or remove guidance.
+    pub async fn run_with_blocks_and_guidance(
+        &mut self,
+        content_blocks: Vec<ContentBlock>,
+        msg_id: &str,
+        guidance: Option<String>,
+    ) -> Result<AgentResult, AgentError> {
+        let changed_guidance = guidance.as_deref() != self.request_guidance.as_ref().map(RequestGuidance::text);
+        self.request_guidance = guidance.map(|text| RequestGuidance::new(text, self.messages.len()));
+        if changed_guidance {
+            self.refresh_local_context_estimate();
+        }
         let command_input = match content_blocks.as_slice() {
             [ContentBlock::Text { text }] => Some(text.clone()),
             _ => None,
@@ -666,7 +696,7 @@ impl AgentEngine {
         // Record prompt state for cache diagnostics
         self.cache_detector.record_request(&system, &tools);
 
-        let mut messages = self.messages.clone();
+        let mut messages = self.request_messages();
         if let Some(prompt) = kind.control_prompt() {
             messages.push(Message::now(
                 Role::User,
@@ -768,6 +798,14 @@ impl AgentEngine {
             }
         }
         definitions
+    }
+
+    fn request_messages(&self) -> Vec<Message> {
+        let mut messages = self.messages.clone();
+        if let Some(guidance) = &self.request_guidance {
+            guidance.project(&mut messages);
+        }
+        messages
     }
 
     /// Classify, execute and re-merge one model turn's tool calls.
@@ -1147,7 +1185,7 @@ impl AgentEngine {
             &self.prompt_usage,
             self.dynamic_system_tokens(),
             &tools,
-            &self.messages,
+            &self.request_messages(),
         );
         self.output.emit_usage_report(serde_json::json!({
             "request_id": uuid::Uuid::now_v7().to_string(),
@@ -1236,7 +1274,7 @@ impl AgentEngine {
             .total_tokens()
             .saturating_add(dynamic_system_tokens)
             .saturating_add(estimate_tool_definitions_tokens(&tools))
-            .saturating_add(estimate_messages_tokens(&self.messages));
+            .saturating_add(estimate_messages_tokens(&self.request_messages()));
         self.context_state.replace_with_local_estimate(context_usage);
         self.sync_compact_watermark();
     }
@@ -1300,6 +1338,7 @@ impl AgentEngine {
                 &self.compact_config,
                 &mut self.compact_state,
                 Some(self.output.as_ref()),
+                self.request_guidance.as_ref().map(RequestGuidance::text),
             )
             .await
             {
@@ -1309,6 +1348,9 @@ impl AgentEngine {
                         result.messages_summarized, result.pre_compact_tokens
                     ));
                     self.messages = result.messages;
+                    if let Some(guidance) = &mut self.request_guidance {
+                        guidance.after_compaction();
+                    }
                     self.context_state.record_compact();
                     self.refresh_local_context_estimate();
                     self.save_session();
@@ -1529,6 +1571,9 @@ impl AgentEngine {
                 }))
             }
             Ok(CommandResult::ContextChanged) => {
+                if let Some(guidance) = &mut self.request_guidance {
+                    guidance.after_compaction();
+                }
                 self.refresh_local_context_estimate();
                 self.save_session();
                 info!(
@@ -1576,6 +1621,7 @@ impl AgentEngine {
             prompt_usage: &self.prompt_usage,
             context_tools: &context_tools,
             dynamic_system_tokens,
+            request_guidance: self.request_guidance.as_ref(),
         };
 
         // SAFETY: cmd_ptr points to a command inside self.commands which is only

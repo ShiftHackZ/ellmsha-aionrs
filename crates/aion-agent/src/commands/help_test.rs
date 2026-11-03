@@ -76,6 +76,7 @@ mod tests {
             prompt_usage: &prompt_usage,
             context_tools: &context_tools,
             dynamic_system_tokens: 0,
+            request_guidance: None,
         };
 
         let cmd = HelpCommand;
@@ -116,6 +117,7 @@ mod tests {
             prompt_usage: &prompt_usage,
             context_tools: &context_tools,
             dynamic_system_tokens: 0,
+            request_guidance: None,
         };
 
         let cmd = HelpCommand;

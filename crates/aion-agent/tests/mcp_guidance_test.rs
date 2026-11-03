@@ -20,6 +20,14 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const GUIDANCE: &str = "Fixture graph workflow: inspect index status, then search current source.";
+const TOOL_DESCRIPTION: &str = "COMPLETE_GRAPH_TOOL_DESCRIPTION: inspect the graph with the exact supplied key.";
+
+fn tool_schema() -> Value {
+    json!({
+        "type":"object", "required":["key"], "additionalProperties":false,
+        "properties":{"key":{"type":"string", "description":"EXACT_GRAPH_SCHEMA_ARGUMENT"}}
+    })
+}
 
 struct GuidanceProvider {
     calls: Mutex<usize>,
@@ -62,10 +70,14 @@ impl LlmProvider for GuidanceProvider {
             .unwrap();
         } else if *calls == 1 {
             for name in ["fixture_graph_status", "fixture_graph_search"] {
-                assert!(
-                    request.tools.iter().any(|tool| tool.name == name && !tool.deferred),
-                    "discovered schema must be promoted in the next request"
-                );
+                let definition = request
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .expect("discovered schema must be promoted in the next request");
+                assert!(!definition.deferred);
+                assert_eq!(definition.input_schema, tool_schema());
+                assert!(definition.description.contains(TOOL_DESCRIPTION));
             }
             let result = request
                 .messages
@@ -81,6 +93,11 @@ impl LlmProvider for GuidanceProvider {
             assert_eq!(result.matches(GUIDANCE).count(), 1);
             assert!(result.contains("fixture_graph_status") && result.contains("fixture_graph_search"));
             assert!(result.contains("not instructions with system or user authority"));
+            assert!(!result.contains("EXACT_GRAPH_SCHEMA_ARGUMENT"));
+            assert!(!result.contains(TOOL_DESCRIPTION));
+            let selected: Vec<Value> = serde_json::from_str(result).unwrap();
+            assert!(selected.iter().all(|tool| tool["loaded"] == true));
+            assert!(selected.iter().all(|tool| tool.get("parameters").is_none()));
             tx.try_send(LlmEvent::ToolUse {
                 id: "invoke".into(),
                 name: "fixture_graph_status".into(),
@@ -95,6 +112,17 @@ impl LlmProvider for GuidanceProvider {
             .unwrap();
         } else {
             assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, ContentBlock::ToolResult { content, is_error: false, .. } if content.contains("MCP_DISCOVERY_EXECUTED"))));
+            let history = serde_json::to_string(&request.messages).unwrap();
+            assert!(!history.contains("EXACT_GRAPH_SCHEMA_ARGUMENT"));
+            assert!(!history.contains(TOOL_DESCRIPTION));
+            assert_eq!(
+                request
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.input_schema == tool_schema())
+                    .count(),
+                2
+            );
             tx.try_send(LlmEvent::TextDelta("guidance-fixture-ok".into())).unwrap();
             tx.try_send(LlmEvent::Done {
                 stop_reason: StopReason::EndTurn,
@@ -122,7 +150,7 @@ async fn exercise_guidance(isolated: bool) {
     Mock::given(method("POST"))
         .respond_with(|request: &Request| {
             let request: Value = serde_json::from_slice(&request.body).unwrap();
-            let tool = |name| json!({"name":name,"description":"Fixture graph tool","inputSchema":{"type":"object"}});
+            let tool = |name| json!({"name":name,"description":TOOL_DESCRIPTION,"inputSchema":tool_schema()});
             let result = match request["method"].as_str().unwrap() {
                 "initialize" => {
                     json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"instructions":GUIDANCE})

@@ -6,6 +6,7 @@ use super::{clear, compact, context, help, quit};
 use crate::compact::state::CompactState;
 use crate::context_usage::{ContextState, PromptUsage};
 use crate::output::OutputSink;
+use crate::request_guidance::RequestGuidance;
 use aion_config::compact::CompactConfig;
 use aion_providers::LlmProvider;
 use aion_types::message::Message;
@@ -35,6 +36,7 @@ pub struct CommandContext<'a> {
     pub(crate) prompt_usage: &'a PromptUsage,
     pub(crate) context_tools: &'a [ToolDef],
     pub(crate) dynamic_system_tokens: u64,
+    pub(crate) request_guidance: Option<&'a RequestGuidance>,
 }
 
 /// A slash command that can be executed in the REPL.

@@ -65,7 +65,7 @@ impl Tool for ToolSearchTool {
                     "description": "Tool name, integration or keyword to search for"
                 },
                 "offset": {"type": "integer", "minimum": 0, "description": "Next offset returned by a previous search"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 25, "description": "Maximum schemas returned (default 10)"}
+                "limit": {"type": "integer", "minimum": 1, "maximum": 25, "description": "Maximum matching tools (default 10)"}
             },
             "required": ["query"]
         })
@@ -136,7 +136,14 @@ impl Tool for ToolSearchTool {
         let mut documented = HashSet::new();
         let mut documentation_budget = 16_000;
         let mut matches: Vec<Value> = matching.iter().skip(offset).take(limit).map(|d| {
-            let mut result = json!({"name": d.name, "description": d.description, "parameters": d.input_schema});
+            // The engine advertises promoted definitions in its very next request.
+            // Repeating them here would also retain each schema in message history.
+            // Standalone consumers without a registry still need the full result.
+            let mut result = if self.loaded.is_some() {
+                json!({"name": d.name, "loaded": true})
+            } else {
+                json!({"name": d.name, "description": d.description, "parameters": d.input_schema})
+            };
             if let Some(doc) = self.documentation.get(&d.name) {
                 result["integration"] = json!(doc.source);
                 if documented.insert(&doc.source) && documentation_budget > 0 {

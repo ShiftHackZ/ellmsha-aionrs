@@ -46,6 +46,7 @@ mod tests_set_config {
     fn make_engine(model: &str) -> super::AgentEngine {
         super::AgentEngine {
             mcp_catalogs: Vec::new(),
+            request_guidance: None,
             provider: Arc::new(NullProvider),
             model: model.to_string(),
             max_tokens: Some(4096),
@@ -466,6 +467,7 @@ mod tests_phase6 {
     fn make_engine(model: &str, allow_list: Vec<String>) -> super::AgentEngine {
         super::AgentEngine {
             mcp_catalogs: Vec::new(),
+            request_guidance: None,
             provider: Arc::new(NullProvider),
             model: model.to_string(),
             max_tokens: Some(4096),
@@ -662,7 +664,7 @@ mod tests_compact {
     use crate::compact::auto::should_autocompact;
     use crate::compact::state::CompactState;
     use crate::confirm::ToolConfirmer;
-    use crate::context_usage::{ContextState, ContextUsageSource};
+    use crate::context_usage::{ContextState, ContextUsageSource, estimate_messages_tokens};
     use crate::output::OutputSink;
     use crate::session::{Session, SessionManager};
 
@@ -773,6 +775,7 @@ mod tests_compact {
     ) -> super::AgentEngine {
         super::AgentEngine {
             mcp_catalogs: Vec::new(),
+            request_guidance: None,
             provider: Arc::new(NullProvider),
             model: "test-model".to_string(),
             max_tokens: Some(4096),
@@ -873,6 +876,37 @@ mod tests_compact {
                 is_error: false,
             }],
         )
+    }
+
+    #[tokio::test]
+    async fn context_command_counts_transient_guidance_without_logging_or_persisting_its_body() {
+        let output = Arc::new(RecordingOutput::default());
+        let mut engine =
+            make_compact_engine_with_output(CompactConfig::default(), CompactState::new(), vec![], output.clone());
+        let guidance = "Complete current global and project rules; private fixture body".to_string();
+        let expected_tokens = estimate_messages_tokens(&[Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: guidance.clone() }],
+        )]);
+        let result = engine
+            .run_with_blocks_and_guidance(
+                vec![ContentBlock::Text {
+                    text: "/context all".into(),
+                }],
+                "context-fixture",
+                Some(guidance.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.turns, 0);
+        assert!(engine.messages.is_empty());
+        let infos = output.infos.lock().unwrap().join("\n");
+        assert!(
+            infos.contains(&format!("Messages: {expected_tokens} tokens")),
+            "{infos}"
+        );
+        assert!(!infos.contains(&guidance));
+        assert!(infos.contains("Largest messages · showing 1"));
     }
 
     #[test]
@@ -1544,6 +1578,7 @@ mod tests_plan_mode {
         let flag = Arc::new(AtomicBool::new(false));
         super::AgentEngine {
             mcp_catalogs: Vec::new(),
+            request_guidance: None,
             provider: Arc::new(NullProvider),
             model: "test-model".to_string(),
             max_tokens: Some(4096),
@@ -1768,6 +1803,7 @@ mod tests_handle_command {
     fn make_engine() -> AgentEngine {
         AgentEngine {
             mcp_catalogs: Vec::new(),
+            request_guidance: None,
             provider: Arc::new(NullProvider),
             model: "test-model".to_string(),
             max_tokens: Some(4096),
@@ -2799,6 +2835,7 @@ mod tests_tool_policy_enforcement {
 
         AgentEngine {
             mcp_catalogs: Vec::new(),
+            request_guidance: None,
             provider: Arc::new(NullProvider),
             compat: ProviderCompat::anthropic_defaults(),
             thinking: None,

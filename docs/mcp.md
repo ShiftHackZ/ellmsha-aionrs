@@ -107,8 +107,11 @@ The native runtime retains optional `initialize.instructions` as server-provided
 **tool documentation**, not system policy. `ToolSearch` returns documentation only
 for matching, policy-allowed tools, once per integration in each result. Search by
 a tool name, integration name, or documentation keyword. The default result page
-contains 10 schemas (maximum 25); use `next_offset` to continue. Documentation is
-bounded to 8 KB per integration and 16 KB per result, with truncation indicated.
+contains 10 matching tools (maximum 25); use `next_offset` to continue. The native
+runtime adds their full schemas to the next model request's available tools;
+search results retain names, load status and scoped documentation without
+duplicating schemas in conversation history. Documentation is bounded to 8 KB per
+integration and 16 KB per result, with truncation indicated.
 Repeated searches do not append documentation to the system prompt. Servers that
 omit instructions continue to work unchanged.
 

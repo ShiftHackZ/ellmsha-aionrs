@@ -34,7 +34,8 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("SpawnTool"));
         assert!(result.content.contains("Spawn sub-agents"));
-        assert!(result.content.contains("parameters"));
+        let values: Vec<Value> = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(values[0]["parameters"], build_tool_defs()[1].input_schema);
     }
 
     #[tokio::test]
@@ -156,6 +157,11 @@ async fn discovery_promotes_only_the_selected_page_in_one_registry() {
     assert_eq!(*loaded.read().unwrap(), HashSet::from(["EnterPlanMode".to_string()]));
     assert!(other_agent.read().unwrap().is_empty());
     assert!(!loaded.read().unwrap().contains("Read"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.content).unwrap(),
+        json!([{"name":"EnterPlanMode", "loaded":true}]),
+        "promoted schemas belong only in the next native tool definitions"
+    );
 }
 
 #[tokio::test]

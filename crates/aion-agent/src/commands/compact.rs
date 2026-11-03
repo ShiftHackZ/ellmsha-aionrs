@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use super::{CommandContext, CommandResult, SlashCommand};
 use crate::compact::auto;
+use crate::request_guidance::RequestGuidance;
 use aion_types::compact::{CompactMetadata, CompactTrigger};
 use aion_types::message::ContentBlock;
 
@@ -28,13 +29,14 @@ impl SlashCommand for CompactCommand {
 
         let pre_tokens = ctx.compact_state.last_input_tokens;
 
-        match auto::autocompact_with_output(
+        match auto::autocompact_with_guidance(
             ctx.provider.as_ref(),
             ctx.messages,
             ctx.model,
             ctx.compact_config,
             ctx.compact_state,
             Some(ctx.output),
+            ctx.request_guidance.map(RequestGuidance::text),
         )
         .await
         {

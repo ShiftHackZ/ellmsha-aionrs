@@ -103,6 +103,20 @@ pub async fn autocompact_with_output(
     state: &mut CompactState,
     output: Option<&dyn crate::output::OutputSink>,
 ) -> Result<CompactResult, CompactError> {
+    autocompact_with_guidance(provider, messages, model, config, state, output, None).await
+}
+
+/// Current host guidance applies to the summarizer but is not part of the
+/// conversation being summarized. Re-project it even after prompt-too-long retries.
+pub(crate) async fn autocompact_with_guidance(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    model: &str,
+    config: &CompactConfig,
+    state: &mut CompactState,
+    output: Option<&dyn crate::output::OutputSink>,
+    guidance: Option<&str>,
+) -> Result<CompactResult, CompactError> {
     // Circuit breaker check
     if state.is_circuit_broken(config) {
         return Err(CompactError::CircuitBroken {
@@ -121,10 +135,19 @@ pub async fn autocompact_with_output(
     let mut ptl_attempts = 0u32;
 
     let summary_text = loop {
+        let mut request_messages = conv_messages.clone();
+        if let Some(guidance) = guidance {
+            // The last message is our own summarization task. Keep the full
+            // snapshot separate from history and never parse user markers.
+            let task = request_messages.last_mut().expect("compaction task is always present");
+            task.content.insert(0, ContentBlock::Text {
+                text: format!("{guidance}\n\nThe managed guidance above applies to this request. Do not reproduce it in the conversation summary; the host supplies the current snapshot independently on subsequent requests."),
+            });
+        }
         let request = LlmRequest {
             model: model.to_string(),
             system: COMPACT_SYSTEM_PROMPT.to_string(),
-            messages: conv_messages.clone(),
+            messages: request_messages,
             tools: vec![],
             max_tokens: Some(COMPACT_MAX_OUTPUT_TOKENS),
             thinking: Some(ThinkingConfig::Disabled),

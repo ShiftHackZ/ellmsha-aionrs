@@ -73,11 +73,11 @@ See [Sub-Agent Spawning](advanced.md#sub-agent-spawning) in the Advanced Feature
 
 ## ToolSearch
 
-Load full schemas for deferred tools so the LLM can invoke them. Deferred tools (from MCP servers with `deferred = true`) are registered by name only — their parameter schemas are not loaded until the LLM calls ToolSearch.
+Discover deferred tools and load their full schemas so the LLM can invoke them. The native runtime omits deferred tools from the model's available tools until ToolSearch selects them, then includes their full definitions in the next request. Search results contain names, load status and scoped integration documentation without repeating the schemas in conversation history. Standalone ToolSearch consumers without a shared registry still receive full schemas in the result.
 
-- Query by exact name: `"select:Read,Edit,Grep"`
+- Query by exact tool name, case-insensitively
 - Keyword search: `"slack send"` returns best matches
-- Returns up to 5 results by default
+- Returns up to 10 matching tools by default (maximum 25); use `next_offset` to continue
 
 ---
 

@@ -32,6 +32,10 @@ impl SlashCommand for ContextCommand {
                 return Ok(CommandResult::Continue);
             }
         };
+        let mut messages = ctx.messages.clone();
+        if let Some(guidance) = ctx.request_guidance {
+            guidance.project(&mut messages);
+        }
         let snapshot = ContextSnapshot::build(
             ctx.model,
             ctx.compact_config.context_window,
@@ -39,7 +43,7 @@ impl SlashCommand for ContextCommand {
             ctx.prompt_usage,
             ctx.dynamic_system_tokens,
             ctx.context_tools,
-            ctx.messages,
+            &messages,
         );
         ctx.output.emit_info(&format_snapshot(&snapshot, expanded));
         Ok(CommandResult::Continue)

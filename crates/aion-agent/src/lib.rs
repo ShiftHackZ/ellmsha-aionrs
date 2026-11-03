@@ -13,6 +13,7 @@ pub mod error;
 pub mod orchestration;
 pub mod output;
 pub mod plan;
+mod request_guidance;
 pub mod session;
 pub mod skill_tool;
 pub mod spawn_tool;

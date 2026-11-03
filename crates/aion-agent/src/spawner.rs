@@ -131,9 +131,9 @@ impl AgentSpawner {
         self
     }
 
-    async fn prepare_child_prompt(&self, sub: &SubAgentConfig, config: &mut Config) -> Result<String, SubAgentResult> {
+    async fn prepare_child_guidance(&self, sub: &SubAgentConfig) -> Result<Option<String>, SubAgentResult> {
         let Some(preflight) = &self.child_preflight else {
-            return Ok(sub.prompt.clone());
+            return Ok(None);
         };
         let rules = preflight.instructions().await.map_err(|error| SubAgentResult {
             name: sub.name.clone(),
@@ -143,13 +143,9 @@ impl AgentSpawner {
             is_error: true,
         })?;
         if rules.is_empty() {
-            return Ok(sub.prompt.clone());
+            return Ok(None);
         }
-        config.system_prompt = Some(format!(
-            "{rules}\n\n{}",
-            config.system_prompt.take().unwrap_or_default()
-        ));
-        Ok(format!("{rules}\n\n{}", sub.prompt))
+        Ok(Some(rules))
     }
 
     pub fn with_child_router(mut self, router: Arc<dyn ChildRouter>) -> Self {
@@ -214,8 +210,8 @@ impl AgentSpawner {
         if let Some(sp) = sub_config.system_prompt.clone() {
             config.system_prompt = Some(sp);
         }
-        let prompt = match self.prepare_child_prompt(&sub_config, &mut config).await {
-            Ok(prompt) => prompt,
+        let guidance = match self.prepare_child_guidance(&sub_config).await {
+            Ok(guidance) => guidance,
             Err(result) => return result,
         };
         config.session.enabled = false;
@@ -253,7 +249,7 @@ impl AgentSpawner {
         engine.set_tool_policy(child_policy);
         engine.set_mcp_catalog(mcp.catalog);
 
-        match engine.run(&prompt, "").await {
+        match engine.run_with_guidance(&sub_config.prompt, "", guidance).await {
             Ok(result) => SubAgentResult {
                 name: sub_config.name,
                 text: match decision {
@@ -356,8 +352,8 @@ impl Spawner for AgentSpawner {
         if let Some(sp) = sub_config.system_prompt.clone() {
             config.system_prompt = Some(sp);
         }
-        let prompt = match self.prepare_child_prompt(&sub_config, &mut config).await {
-            Ok(prompt) => prompt,
+        let guidance = match self.prepare_child_guidance(&sub_config).await {
+            Ok(guidance) => guidance,
             Err(result) => return result,
         };
         config.session.enabled = false;
@@ -397,7 +393,7 @@ impl Spawner for AgentSpawner {
         engine.set_tool_policy(child_policy);
         engine.set_mcp_catalog(mcp.catalog);
 
-        match engine.run(&prompt, "").await {
+        match engine.run_with_guidance(&sub_config.prompt, "", guidance).await {
             Ok(result) => SubAgentResult {
                 name: sub_config.name,
                 text: match decision {
