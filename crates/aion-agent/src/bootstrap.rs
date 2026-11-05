@@ -73,6 +73,7 @@ pub struct AgentBootstrap {
     child_router: Option<Arc<dyn ChildRouter>>,
     child_preflight: Option<Arc<dyn ChildPromptPreflight>>,
     host_delegation: bool,
+    host_project_instructions: bool,
     host_approval: Option<(Arc<ToolApprovalManager>, Arc<dyn ProtocolEmitter>)>,
     resume_session: Option<Session>,
     runtime_env: Vec<(String, String)>,
@@ -115,6 +116,7 @@ impl AgentBootstrap {
             child_router: None,
             child_preflight: None,
             host_delegation: false,
+            host_project_instructions: false,
             host_approval: None,
             resume_session: None,
             runtime_env: Vec::new(),
@@ -125,6 +127,13 @@ impl AgentBootstrap {
     /// Use a pre-created provider instead of creating one from config.
     pub fn provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
         self.provider = Some(provider);
+        self
+    }
+
+    /// The embedding host supplies repository guidance from its authorized chat
+    /// scope. Keep all other native config, skills and prompt sections.
+    pub fn project_instructions_from_host(mut self) -> Self {
+        self.host_project_instructions = true;
         self
     }
 
@@ -331,7 +340,7 @@ impl AgentBootstrap {
     }
 
     fn configure_system_prompt(&mut self, environment: &BootstrapEnvironment, skills: &[SkillMetadata]) -> PromptUsage {
-        let mut prompt_cache = if self.config.isolated_session {
+        let mut prompt_cache = if self.config.isolated_session || self.host_project_instructions {
             SystemPromptCache::isolated()
         } else {
             SystemPromptCache::new()
