@@ -27,6 +27,7 @@ const CATALOG_REFRESH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A connected MCP server with its discovered tools and capabilities
 struct McpServer {
+    sensitive: bool,
     #[allow(dead_code)]
     name: String,
     transport: Box<dyn McpTransport>,
@@ -166,7 +167,9 @@ impl McpManager {
             }
         };
 
-        Self::initialize_transport(name, transport).await
+        let mut server = Self::initialize_transport(name, transport).await?;
+        server.sensitive = config.sensitive;
+        Ok(server)
     }
 
     async fn initialize_transport(name: &str, transport: Box<dyn McpTransport>) -> Result<McpServer, McpError> {
@@ -223,6 +226,7 @@ impl McpManager {
             .filter(|text| !text.trim().is_empty())
             .map(|text| truncate_utf8(&text, 16_000).to_string());
         Ok(McpServer {
+            sensitive: false,
             name: name.to_string(),
             transport,
             tools: RwLock::new(tools),
@@ -345,6 +349,11 @@ impl McpManager {
     }
 
     /// Documentation belongs to this initialized connection and is not a system policy.
+    /// Comes only from the host configuration, not the server tool annotations.
+    pub fn server_sensitive(&self, name: &str) -> bool {
+        self.servers.get(name).is_some_and(|server| server.sensitive)
+    }
+
     pub fn server_documentation(&self, server_name: &str) -> Option<ToolDocumentation> {
         let content = self.servers.get(server_name)?.instructions.clone()?;
         Some(ToolDocumentation {
@@ -501,6 +510,7 @@ impl McpManager {
             servers.insert(
                 name.to_string(),
                 McpServer {
+                    sensitive: false,
                     name: name.to_string(),
                     transport,
                     tools: RwLock::new(vec![]),

@@ -129,6 +129,7 @@ mod tests {
             headers: None,
             deferred,
             startup_timeout_ms: None,
+            sensitive: false,
         }
     }
 

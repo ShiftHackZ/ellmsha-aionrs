@@ -88,11 +88,13 @@ mod tests {
             headers: None,
             deferred: None,
             startup_timeout_ms,
+            sensitive: false,
         }
     }
 
     fn successful_test_server(name: &str) -> McpServer {
         McpServer {
+            sensitive: false,
             name: name.to_string(),
             transport: Box::new(MockTransport::new(vec![])),
             tools: RwLock::new(vec![]),

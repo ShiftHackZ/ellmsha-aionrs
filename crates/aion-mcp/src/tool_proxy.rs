@@ -115,7 +115,17 @@ impl Tool for McpToolProxy {
         })
     }
 
+    fn sensitive(&self) -> bool {
+        self.manager.server_sensitive(&self.server_name)
+    }
+
     fn describe(&self, input: &Value) -> String {
+        if self.sensitive() {
+            return format!(
+                "MCP {}/{}: <sensitive arguments hidden>",
+                self.server_name, self.tool_name
+            );
+        }
         format!(
             "MCP {}/{}: {}",
             self.server_name,

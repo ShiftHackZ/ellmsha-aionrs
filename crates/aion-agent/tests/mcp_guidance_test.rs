@@ -185,6 +185,7 @@ async fn exercise_guidance(isolated: bool) {
             headers: None,
             deferred: Some(true),
             startup_timeout_ms: Some(1000),
+            sensitive: false,
         },
     );
     for path in ["parent", "dynamic", "child", "fork"] {

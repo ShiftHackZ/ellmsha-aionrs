@@ -116,6 +116,7 @@ async fn spawned_and_forked_agents_can_call_parent_memory_mcp() {
             headers: None,
             deferred: Some(true),
             startup_timeout_ms: Some(1000),
+            sensitive: false,
         },
     );
     let response = || {

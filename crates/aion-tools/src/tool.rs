@@ -118,6 +118,11 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Redacts host-owned presentation only; execution and model results retain their original values.
+    fn sensitive(&self) -> bool {
+        false
+    }
+
     /// Human-readable description of what the tool will do with the given input
     fn describe(&self, input: &Value) -> String {
         format!("{}: {}", self.name(), serde_json::to_string(input).unwrap_or_default())

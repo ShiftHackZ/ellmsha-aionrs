@@ -49,6 +49,9 @@ pub enum TransportType {
 /// A single MCP server configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
+    /// Host-attested sensitivity; never accepted from JSON/configuration or an MCP server.
+    #[serde(skip)]
+    pub sensitive: bool,
     pub transport: TransportType,
     /// For stdio transport: the command to run
     pub command: Option<String>,

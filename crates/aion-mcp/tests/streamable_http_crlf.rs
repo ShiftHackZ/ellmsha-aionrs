@@ -105,6 +105,7 @@ async fn stateful_fastmcp_style_server_exposes_tools() {
         headers: None,
         deferred: None,
         startup_timeout_ms: Some(5_000),
+        sensitive: false,
     };
     let configs = HashMap::from([("meta-ads".to_string(), config)]);
 

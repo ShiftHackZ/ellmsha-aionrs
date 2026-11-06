@@ -979,7 +979,16 @@ impl AgentEngine {
                         "tool result emitted"
                     );
                 }
-                self.output.emit_tool_result(tool_use_id, tool_name, *is_error, content);
+                self.output.emit_tool_result(
+                    tool_use_id,
+                    tool_name,
+                    *is_error,
+                    if self.tools.get(tool_name).is_some_and(|tool| tool.sensitive()) {
+                        "<sensitive result hidden>"
+                    } else {
+                        content
+                    },
+                );
             }
         }
     }
@@ -1123,7 +1132,11 @@ impl AgentEngine {
                             "provider tool call received"
                         );
                     }
-                    let input_str = to_string(&input).unwrap_or_default();
+                    let input_str = if self.tools.get(&name).is_some_and(|tool| tool.sensitive()) {
+                        crate::orchestration::sensitive_summary(&input).to_string()
+                    } else {
+                        to_string(&input).unwrap_or_default()
+                    };
                     self.output.emit_tool_call(&id, &name, &input_str);
                     tool_calls.push(ContentBlock::ToolUse { id, name, input, extra });
                 }

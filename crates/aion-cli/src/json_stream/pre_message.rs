@@ -42,6 +42,7 @@ fn to_mcp_server_config(
         headers,
         deferred: Some(false),
         startup_timeout_ms: None,
+        sensitive: false,
     })
 }
 

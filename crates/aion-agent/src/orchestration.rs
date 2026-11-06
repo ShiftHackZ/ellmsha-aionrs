@@ -1,3 +1,26 @@
+/// Metadata allowed in human approvals; never titles, queries, field names or values.
+pub(crate) fn sensitive_summary(input: &serde_json::Value) -> serde_json::Value {
+    let mut summary = serde_json::json!({"sensitive":true});
+    if let Some(id) = input.get("id").and_then(serde_json::Value::as_str)
+        && id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+    {
+        summary["record_id"] = serde_json::json!(id);
+    }
+    if let Some(revision) = input.get("expected_revision").and_then(serde_json::Value::as_u64) {
+        summary["expected_revision"] = revision.into();
+    }
+    if let Some(candidates) = input.get("candidate_ids").and_then(serde_json::Value::as_array) {
+        summary["candidate_count"] = candidates.len().into();
+    }
+    summary
+}
 use std::sync::{Arc, Mutex};
 
 use crate::confirm::{ConfirmResult, ToolConfirmer};
@@ -52,7 +75,7 @@ pub async fn execute_tool_calls(
             // so no skill hooks merging is needed here.
             let mut approved = Vec::new();
             for call in &batch.calls {
-                match confirm_call(confirmer, call)? {
+                match confirm_call(registry, confirmer, call)? {
                     Some(denied) => {
                         results.push(denied);
                         modifiers.push(None);
@@ -74,7 +97,7 @@ pub async fn execute_tool_calls(
             }
         } else {
             for call in &batch.calls {
-                match confirm_call(confirmer, call)? {
+                match confirm_call(registry, confirmer, call)? {
                     Some(denied) => {
                         results.push(denied);
                         modifiers.push(None);
@@ -117,6 +140,7 @@ pub enum ExecutionControl {
 
 /// Confirm a single tool call. Returns Ok(Some(result)) if denied, Ok(None) if approved, Err if quit.
 fn confirm_call(
+    registry: &ToolRegistry,
     confirmer: &Arc<Mutex<ToolConfirmer>>,
     call: &ContentBlock,
 ) -> Result<Option<ContentBlock>, ExecutionControl> {
@@ -124,7 +148,11 @@ fn confirm_call(
         return Ok(None);
     };
 
-    let input_display = serde_json::to_string(input).unwrap_or_default();
+    let input_display = if registry.get(name).is_some_and(|tool| tool.sensitive()) {
+        sensitive_summary(input).to_string()
+    } else {
+        serde_json::to_string(input).unwrap_or_default()
+    };
     let result = confirmer
         .lock()
         .unwrap()
@@ -267,7 +295,12 @@ pub async fn execute_tool_calls_with_approval(
             .unwrap_or_else(|| id.clone());
         let tool = registry.get(name);
         let category = tool.map(|t| t.category()).unwrap_or(ToolCategory::Exec);
-        let description = tool.map(|t| t.describe(input)).unwrap_or_default();
+        let sensitive = tool.is_some_and(|tool| tool.sensitive());
+        let description = if sensitive {
+            "Sensitive tool operation".into()
+        } else {
+            tool.map(|t| t.describe(input)).unwrap_or_default()
+        };
         let mcp_identity = tool.and_then(|tool| tool.mcp_approval_identity());
 
         // Check if approval is needed
@@ -288,7 +321,11 @@ pub async fn execute_tool_calls_with_approval(
                 tool: ToolInfo {
                     name: name.clone(),
                     category,
-                    args: input.clone(),
+                    args: if sensitive {
+                        sensitive_summary(input)
+                    } else {
+                        input.clone()
+                    },
                     description,
                 },
             });
@@ -345,7 +382,11 @@ pub async fn execute_tool_calls_with_approval(
                 call_id: approval_id.clone(),
                 tool_name: name.clone(),
                 status,
-                output: content.clone(),
+                output: if sensitive {
+                    "<sensitive result hidden>".into()
+                } else {
+                    content.clone()
+                },
                 output_type: OutputType::Text,
                 metadata: None,
             });
